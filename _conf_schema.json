@@ -53,6 +53,12 @@
     "default": [],
     "hint": "一个 QQ 号 = 一个 aiocqhttp 平台实例。留空 = 归档全部实例（默认）；填写平台实例 id 或登录 QQ 号则只归档指定的 bot，例如 [\"123456789\", \"my_bot_2\"]。"
   },
+  "aliases": {
+    "description": "对话别名（每项一条：别名,群号或QQ号）",
+    "type": "list",
+    "default": [],
+    "hint": "给群聊/私聊起别名，便于在指令和查询中使用（写法：闲聊群,748791823）。也可以直接对 bot 说「给 XX 加个别名 YY」来管理；自动登记的名称由插件维护，无需填写。"
+  },
   "count_per_batch": {
     "description": "单次 API 拉取条数",
     "type": "int",

@@ -70,6 +70,11 @@ class NapcatHistoryExporter(Star):
         self.verify_days = max(1, min(int(config.get("verify_days", 3) or 3), 30))
         self._verify_task: asyncio.Task | None = None
         self._file_lock = asyncio.Lock()      # 写入段串行化（并发任务防护）
+        # v2.2.0: 对话别名注册系统
+        self.aliases_file = self.export_dir / "aliases.json"
+        self.aliases = self._load_aliases()
+        self._alias_cfg = [str(x).strip() for x in (config.get("aliases") or [])
+                           if str(x).strip()]
 
     # ---------------------------------------------------------------
     # 内部工具
@@ -88,6 +93,309 @@ class NapcatHistoryExporter(Star):
                 encoding="utf-8")
         except Exception as e:
             logger.error(f"保存导出状态失败: {e}")
+
+    # ---------------- 对话别名注册系统（v2.2.0） ----------------
+
+    def _load_aliases(self) -> dict:
+        """读取 aliases.json（不存在时返回空结构）。"""
+        try:
+            data = json.loads(self.aliases_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data.setdefault("group", {})
+                data.setdefault("private", {})
+                return data
+        except Exception:
+            pass
+        return {"group": {}, "private": {}}
+
+    def _save_aliases(self) -> None:
+        try:
+            self.aliases_file.write_text(
+                json.dumps(self.aliases, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+        except Exception as e:
+            logger.error(f"[别名] 保存 aliases.json 失败: {e}")
+
+    def _alias_entry(self, chat: str, tid: str, create: bool = False):
+        """获取（或创建）某目标的别名条目。"""
+        tid = str(tid)
+        bucket = self.aliases.get(chat)
+        if bucket is None:
+            if not create:
+                return None
+            bucket = self.aliases.setdefault(chat, {})
+        ent = bucket.get(tid)
+        if ent is None and create:
+            ent = {"name": "", "aliases": [], "updated": ""}
+            bucket[tid] = ent
+        return ent if isinstance(ent, dict) else None
+
+    def _register_name(self, chat: str, tid: str, name: str) -> None:
+        """记录/更新目标名称（群名或好友昵称）。"""
+        name = (name or "").strip()
+        if not name:
+            return
+        ent = self._alias_entry(chat, tid, create=True)
+        if ent is None:
+            return
+        if ent.get("name") != name:
+            ent["name"] = name
+            ent["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._save_aliases()
+
+    def _aliases_of(self, chat: str, tid: str) -> list:
+        ent = self._alias_entry(chat, tid) or {}
+        return [str(a) for a in (ent.get("aliases") or []) if str(a).strip()]
+
+    def _target_label(self, chat: str, tid: str) -> str:
+        """目标展示标签：「名称/别名 (群号或QQ号)」。"""
+        ent = self._alias_entry(chat, tid) or {}
+        name = str(ent.get("name") or "").strip()
+        als = self._aliases_of(chat, tid)
+        prefix = name or (als[0] if als else ("群聊" if chat == "group" else "私聊"))
+        tag = f"群{tid}" if chat == "group" else f"QQ{tid}"
+        return f"{prefix} ({tag})"
+
+    def _alias_add(self, chat: str, tid: str, alias: str):
+        """新增别名。返回错误信息；成功返回 None。"""
+        alias = (alias or "").strip()
+        if not alias:
+            return "别名不能为空"
+        if alias.isdigit():
+            return "别名不能是纯数字（会与群号/QQ号冲突）"
+        for c, bucket in self.aliases.items():
+            for t, ent in (bucket or {}).items():
+                if c == chat and str(t) == str(tid):
+                    continue
+                if not isinstance(ent, dict):
+                    continue
+                if alias in (ent.get("aliases") or []):
+                    return f"别名「{alias}」已被 {self._target_label(c, t)} 使用"
+        ent = self._alias_entry(chat, tid, create=True)
+        if ent is None:
+            return "创建别名条目失败"
+        aliases = ent.setdefault("aliases", [])
+        if alias not in aliases:
+            aliases.append(alias)
+        ent["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._save_aliases()
+        return None
+
+    def _alias_remove(self, chat: str, tid: str, alias: str):
+        """删除别名。返回错误信息；成功返回 None。"""
+        alias = (alias or "").strip()
+        ent = self._alias_entry(chat, tid)
+        if ent is None:
+            return "该目标还没有登记（先归档一次或添加别名）"
+        aliases = ent.get("aliases") or []
+        if alias not in aliases:
+            return (f"该目标没有别名「{alias}」"
+                    f"（当前：{'、'.join(aliases) if aliases else '无'}）")
+        aliases.remove(alias)
+        ent["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._save_aliases()
+        return None
+
+    def _resolve_target(self, text: str, prefer_chat: str = ""):
+        """把「群号 / QQ号 / 别名」解析为 (chat, tid)。
+        返回 None = 未找到；返回 ("AMBIGUOUS", hits) = 别名歧义。"""
+        s = (text or "").strip()
+        if not s:
+            return None
+        if s.isdigit():
+            if prefer_chat:
+                return (prefer_chat, s)
+            for c in ("group", "private"):
+                if self._alias_entry(c, s):
+                    return (c, s)
+            return ("group", s)
+        low = s.lower()
+        hits: list = []
+        for c, bucket in self.aliases.items():
+            for t, ent in (bucket or {}).items():
+                if not isinstance(ent, dict):
+                    continue
+                for a in (ent.get("aliases") or []):
+                    if str(a).lower() == low:
+                        hits.append((c, str(t)))
+        if not hits:
+            return None
+        if len(hits) == 1:
+            return hits[0]
+        if prefer_chat:
+            same = [h for h in hits if h[0] == prefer_chat]
+            if len(same) == 1:
+                return same[0]
+        return ("AMBIGUOUS", hits)
+
+    def _alias_hint(self, text: str) -> str:
+        """别名歧义时的用户提示。"""
+        r = self._resolve_target(text)
+        if isinstance(r, tuple) and len(r) == 2 and r[0] == "AMBIGUOUS":
+            opts = "；".join(self._target_label(c, t) for c, t in r[1])
+            return (f"⚠️ 别名「{text.strip()}」对应多个目标：{opts}。"
+                    f"请改用群号/QQ号指定。")
+        return ""
+
+    def _resolve_gid(self, raw: str, kind: str = "group"):
+        """工具入口的目标解析：支持群号或别名。
+        返回 (gid, None)；失败时 (None, 错误提示)。"""
+        s = (raw or "").strip()
+        if s.isdigit():
+            return (s, None)
+        r = self._resolve_target(s, prefer_chat=kind)
+        if r is None:
+            name = "群" if kind == "group" else "好友"
+            return (None, f"❌ 未找到{name}「{s}」：尚未归档或别名不存在"
+                          f"（可先用群号/QQ号归档一次）")
+        if isinstance(r, tuple) and len(r) == 2 and r[0] == "AMBIGUOUS":
+            return (None, self._alias_hint(s))
+        if r[0] != kind:
+            return (None, f"❌「{s}」对应的是"
+                          f"{'私聊' if r[0] == 'private' else '群聊'}目标，"
+                          f"请改用对应的"
+                          f"{'QQ号' if r[0] == 'private' else '群号'}。")
+        return (r[1], None)
+
+    def _sync_alias_config(self) -> None:
+        """把配置项 aliases（形如「别名,群号」）合并进 aliases.json。"""
+        added = 0
+        for item in self._alias_cfg:
+            raw = str(item).strip()
+            if not raw:
+                continue
+            alias, target = "", raw
+            if "," in raw or "，" in raw:
+                alias, _, target = raw.replace("，", ",").partition(",")
+                alias, target = alias.strip(), target.strip()
+            if not target.isdigit():
+                continue
+            chat = "group"
+            for c in ("group", "private"):
+                if self._alias_entry(c, target):
+                    chat = c
+                    break
+            self._alias_entry(chat, target, create=True)
+            if alias:
+                if self._alias_add(chat, target, alias) is None:
+                    added += 1
+        if added:
+            logger.info(f"[别名] 已从配置同步 {added} 个别名")
+
+    async def _flush_alias_config(self) -> None:
+        """把别名回写配置项并保存（保持 WebUI 显示同步）。"""
+        lines = []
+        for chat in ("group", "private"):
+            for tid, ent in (self.aliases.get(chat) or {}).items():
+                if not isinstance(ent, dict):
+                    continue
+                for a in (ent.get("aliases") or []):
+                    lines.append(f"{a},{tid}")
+        try:
+            self.config["aliases"] = lines
+        except Exception:
+            return
+        try:
+            saver = getattr(self.config, "save_config_async", None)
+            if callable(saver):
+                await saver()
+            else:
+                self.config.save_config()
+        except Exception as e:
+            logger.error(f"[别名] 回写配置失败: {e}")
+
+    async def _refresh_target_names(self, clients: list) -> int:
+        """从后端刷新已归档目标的名称（群名/好友昵称）。"""
+        if not clients:
+            return 0
+        groups: dict = {}
+        friends: dict = {}
+        for pid, qq, client in clients:
+            try:
+                for g in (await client.call_action("get_group_list") or []):
+                    gid = str(g.get("group_id", ""))
+                    if gid and gid not in groups:
+                        groups[gid] = str(g.get("group_name") or "")
+            except Exception:
+                pass
+            try:
+                for f in (await client.call_action("get_friend_list") or []):
+                    uid = str(f.get("user_id", ""))
+                    if uid and uid not in friends:
+                        friends[uid] = str(f.get("nickname")
+                                           or f.get("remark") or "")
+            except Exception:
+                pass
+        n = 0
+        for chat, tid in self._scan_archived_targets():
+            if chat == "group" and tid in groups:
+                self._register_name("group", tid, groups[tid])
+                n += 1
+            elif chat == "private" and tid in friends:
+                self._register_name("private", tid, friends[tid])
+                n += 1
+        if n:
+            logger.info(f"[别名] 已刷新 {n} 个归档目标的名称")
+        return n
+
+    async def _refresh_names_safe(self) -> None:
+        """启动时后台刷新目标名称（等待客户端就绪，异常不外抛）。"""
+        try:
+            clients: list = []
+            for i in range(3):
+                try:
+                    clients = await self._get_clients()
+                except Exception:
+                    clients = []
+                if clients:
+                    break
+                if i < 2:
+                    await asyncio.sleep(10)
+            if clients:
+                await self._refresh_target_names(clients)
+        except Exception as e:
+            logger.error(f"[别名] 刷新目标名称失败: {e}")
+
+    def _alias_list_text(self) -> str:
+        targets = self._scan_archived_targets()
+        if not targets:
+            return "📭 暂无已归档目标（归档过一次后会自动登记名称）。"
+        lines = ["📇 归档目标与别名："]
+        for chat, tid in targets:
+            als = self._aliases_of(chat, tid)
+            lines.append(f"• {self._target_label(chat, tid)}｜别名："
+                         f"{'、'.join(als) if als else '（无）'}")
+        lines.append("提示：可以让 bot「给 XX 加个别名 YY」来管理别名。")
+        return "\n".join(lines)
+
+    def _archived_targets_text(self) -> str:
+        targets = self._scan_archived_targets()
+        if not targets:
+            return "📭 暂无已归档目标。"
+        lines = ["📦 归档目标清单："]
+        total = 0
+        for chat, tid in targets:
+            prefix = "private_" if chat == "private" else ""
+            files = sorted(self.export_dir.glob(f"napcat_{prefix}{tid}_*.jsonl"))
+            days = len(files)
+            rows = 0
+            size = 0
+            for fp in files:
+                try:
+                    size += fp.stat().st_size
+                    with open(fp, encoding="utf-8",
+                              errors="replace") as f:
+                        rows += sum(1 for _ in f)
+                except Exception:
+                    continue
+            total += rows
+            als = self._aliases_of(chat, tid)
+            lines.append(
+                f"• {self._target_label(chat, tid)}｜别名："
+                f"{'、'.join(als) if als else '无'}｜{days} 天｜"
+                f"{rows} 条｜{size / 1024 / 1024:.1f} MB")
+        lines.append(f"\n合计：{len(targets)} 个目标，{total} 条消息。")
+        return "\n".join(lines)
 
     def _scan_archived_targets(self) -> list:
         """v2.1.0: 扫描导出目录，收集已有归档记录的目标 [(chat, target_id)]。"""
@@ -722,6 +1030,7 @@ class NapcatHistoryExporter(Star):
                 gid = str(g.get("group_id", ""))
                 if not gid:
                     continue
+                self._register_name("group", gid, g.get("group_name") or "")
                 if gid in seen_targets:
                     continue  # 同一轮其他 bot 已导出（同群消息一致）
                 seen_targets.add(gid)
@@ -745,6 +1054,7 @@ class NapcatHistoryExporter(Star):
                     uid = str(f.get("user_id", ""))
                     if not uid:
                         continue
+                    self._register_name("private", uid, f.get("nickname") or "")
                     if uid in seen_targets:
                         continue
                     seen_targets.add(uid)
@@ -911,6 +1221,13 @@ class NapcatHistoryExporter(Star):
     # ---------------------------------------------------------------
 
     async def initialize(self) -> None:
+        # v2.2.0: 别名系统初始化（加载 + 同步配置 + 后台刷新名称）
+        try:
+            self.aliases = self._load_aliases()
+            self._sync_alias_config()
+            asyncio.create_task(self._refresh_names_safe())
+        except Exception as e:
+            logger.error(f"[别名] 初始化异常: {e}")
         if self.auto_export:
             self._task = asyncio.create_task(self._auto_loop())
             logger.info("NapCat 历史导出器已启动自动归档（每 %ss 增量导出一次，"
@@ -953,15 +1270,15 @@ class NapcatHistoryExporter(Star):
         v1.5.0：多 bot 时按触发本消息的 bot（self_id）路由到对应实例归档，
         目标群必须属于该 bot（或用 get_export_status 查看归档了哪些 bot）。
         Args:
-          group_id(string): 目标 QQ 群号（纯数字，必填）
+          group_id(string): 目标群（群号或别名，必填）
           count(number): 导出的消息条数上限（默认 200，最大 5000）
         返回: 导出摘要（新增条数、文件路径）
         '''
         if not self._is_allowed(event):
             return "❌ 无权限：仅管理员可以使用此工具。"
-        gid = group_id.strip()
-        if not gid.isdigit():
-            return f"❌ 群号格式错误：{group_id}。群号应为纯数字。"
+        gid, _err = self._resolve_gid(group_id, "group")
+        if _err:
+            return _err
         count = max(1, min(int(count), 5000))
         client, pid, qq = await self._client_for_event(event)
         if client is None:
@@ -989,15 +1306,15 @@ class NapcatHistoryExporter(Star):
         v1.5.0：多 bot 时按触发本消息的 bot（self_id）路由到对应实例归档，
         目标好友必须属于该 bot。
         Args:
-          user_id(string): 目标 QQ 号（纯数字，必填）
+          user_id(string): 目标好友（QQ 号或别名，必填）
           count(number): 导出的消息条数上限（默认 200，最大 5000）
         返回: 导出摘要（新增条数、文件路径）
         '''
         if not self._is_allowed(event):
             return "❌ 无权限：仅管理员可以使用此工具。"
-        uid = user_id.strip()
-        if not uid.isdigit():
-            return f"❌ QQ 号格式错误：{user_id}。应为纯数字。"
+        uid, _err = self._resolve_gid(user_id, "private")
+        if _err:
+            return _err
         count = max(1, min(int(count), 5000))
         client, pid, qq = await self._client_for_event(event)
         if client is None:
@@ -1028,7 +1345,7 @@ class NapcatHistoryExporter(Star):
         的群；留空 group_id 时归档该 bot 的全部群。
 
         Args:
-          group_id(string): 目标群号（可选，留空=该 bot 全部群）
+          group_id(string): 目标群（群号或别名，可选；留空=该 bot 全部群）
           start_date(string): 开始日期 YYYY-MM-DD（可选，留空=不限起点）
           end_date(string): 结束日期 YYYY-MM-DD（可选，留空=不限终点）
         返回: 归档摘要（新增条数、文件路径）
@@ -1056,9 +1373,9 @@ class NapcatHistoryExporter(Star):
             return "❌ 开始日期不能晚于结束日期。"
         # 指定群
         if group_id:
-            gid = group_id.strip()
-            if not gid.isdigit():
-                return f"❌ 群号格式错误：{group_id}。群号应为纯数字。"
+            gid, _err = self._resolve_gid(group_id, "group")
+            if _err:
+                return _err
             written = await self._export_target(
                 "group", gid, start_ts=start_ts, end_ts=end_ts,
                 client=client, bot_tag=bot_tag, ignore_seen=True)
@@ -1170,16 +1487,16 @@ class NapcatHistoryExporter(Star):
         适用于查看本插件导出的历史消息，无需依赖 LLM 推理。
 
         Args:
-          group_id(string): 目标 QQ 群号（纯数字，必填）
+          group_id(string): 目标群（群号或别名，必填）
           count(number): 返回条数上限（默认 20，最大 200）
 
         返回: 最近 N 条消息文本（时间正序）
         '''
         if not self._is_allowed(event):
             return "❌ 无权限：仅管理员可以使用此工具。"
-        gid = group_id.strip()
-        if not gid.isdigit():
-            return f"❌ 群号格式错误：{group_id}。群号应为纯数字。"
+        gid, _err = self._resolve_gid(group_id, "group")
+        if _err:
+            return _err
         count = max(1, min(int(count), 200))
         files = self._read_group_files(gid)
         if not files:
@@ -1215,7 +1532,7 @@ class NapcatHistoryExporter(Star):
         条件可任意组合，全部满足才命中。
 
         Args:
-          group_id(string): 目标 QQ 群号（纯数字，必填）
+          group_id(string): 目标群（群号或别名，必填）
           keyword(string): 消息内容关键词（子串匹配，不区分大小写，可选）
           date(string): 日期过滤 YYYY-MM-DD（可选）
           user_id(string): QQ 号精确匹配（可选）
@@ -1226,9 +1543,9 @@ class NapcatHistoryExporter(Star):
         '''
         if not self._is_allowed(event):
             return "❌ 无权限：仅管理员可以使用此工具。"
-        gid = group_id.strip()
-        if not gid.isdigit():
-            return f"❌ 群号格式错误：{group_id}。群号应为纯数字。"
+        gid, _err = self._resolve_gid(group_id, "group")
+        if _err:
+            return _err
         count = max(1, min(int(count), 200))
         kw = keyword.strip() if keyword else None
         dt = date.strip() if date else None
@@ -1268,23 +1585,55 @@ class NapcatHistoryExporter(Star):
     @filter.llm_tool("list_archived_groups")
     async def list_archived_groups(self, event: AstrMessageEvent):
         '''
-        列出已有归档记录的群号列表（按文件名提取，去重排序）。
+        列出所有已归档的群聊/私聊：名称、群号/QQ号、别名、归档天数与消息条数。
+        （v2.2.0 起包含别名与统计信息）
 
-        返回: 群号列表
+        返回: 归档目标清单
         '''
         if not self._is_allowed(event):
             return "❌ 无权限：仅管理员可以使用此工具。"
-        import re as _re
-        groups = set()
-        for p in self.export_dir.glob("napcat_*.jsonl"):
-            m = _re.match(r"napcat_(\d+)_\d{4}-\d{2}-\d{2}\.jsonl$", p.name)
-            if m:
-                groups.add(m.group(1))
-                continue
-            m2 = _re.match(r"napcat_(\d+)\.jsonl$", p.name)
-            if m2:
-                groups.add(m2.group(1))
-        if not groups:
-            return "📭 暂无任何归档记录（目录: {})".format(self.export_dir)
-        lines = sorted(groups)
-        return "📂 已有归档的群:\n" + "\n".join(lines)
+        return self._archived_targets_text()
+
+    @filter.llm_tool("alias_manage")
+    async def alias_manage(self, event: AstrMessageEvent,
+                           action: str = "list",
+                           target: str = "", alias: str = ""):
+        '''
+        管理归档目标的别名：别名可替代群号/QQ号用于归档、查询等指令。
+
+        Args:
+          action(string): 操作：add=新增别名，remove=删除别名，list=查看全部（默认 list）
+          target(string): 目标：群号 / QQ号 / 已有别名（add/remove 必填）
+          alias(string): 要新增或删除的别名（add/remove 必填）
+
+        返回: 操作结果或别名列表
+        '''
+        if not self._is_allowed(event):
+            return "❌ 无权限：仅管理员可以使用此工具。"
+        act = (action or "list").strip().lower()
+        if act in ("", "list", "ls", "查看"):
+            return self._alias_list_text()
+        if act not in ("add", "remove", "del", "delete", "新增", "删除"):
+            return f"❌ 未知操作「{action}」，可用：add / remove / list"
+        if not target.strip():
+            return "❌ 请提供目标（群号 / QQ号 / 已有别名）"
+        if not alias.strip():
+            return "❌ 请提供别名"
+        r = self._resolve_target(target)
+        if r is None:
+            return (f"❌ 未找到目标「{target.strip()}」：尚未归档或别名不存在"
+                    f"（可先用群号/QQ号归档一次）")
+        if isinstance(r, tuple) and len(r) == 2 and r[0] == "AMBIGUOUS":
+            return self._alias_hint(target)
+        chat, tid = r
+        if act in ("add", "新增"):
+            err = self._alias_add(chat, tid, alias)
+        else:
+            err = self._alias_remove(chat, tid, alias)
+        if err:
+            return f"❌ {err}"
+        await self._flush_alias_config()
+        cur = self._aliases_of(chat, tid)
+        return (f"✅ 已{'新增' if act in ('add', '新增') else '删除'}"
+                f"别名「{alias.strip()}」→ {self._target_label(chat, tid)}\n"
+                f"当前别名：{'、'.join(cur) if cur else '（无）'}")

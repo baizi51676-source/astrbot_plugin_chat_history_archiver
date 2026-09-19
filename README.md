@@ -15,6 +15,7 @@
 - 媒体占位符：图片/表情/语音/视频/引用/@/文件等统一替换为可读文本
 - 增量游标：记录每个会话的最新消息，重复运行只追加新消息；文件自动去重，不会重复
 - 启动自动补全（startup_verify）：每次插件启动时自动检查最近几天（verify_days）的归档文件，与后端拉取到的消息对比，自动补齐缺失日期或不全的记录
+- 对话别名（aliases）：给群聊/私聊起别名，指令与查询可直接用别名代替群号/QQ号；群名/昵称自动登记
 - 内置查看/搜索：已归档记录可直接用 LLM 工具读取、搜索、回溯（无需任何外部插件联动）
 - 多 bot 归档：一个 AstrBot 可挂多个 QQ 号，插件为每个 bot 独立归档；可用 archive_bots 指定范围
 - 后端自动探测：NapCat / SnowLuma 自动识别（backend: auto），无需手动指定
@@ -77,16 +78,28 @@ archive_bots:
 | seq | 消息序号（NapCat 为 message_seq；SnowLuma 为会话序号，用于增量去重）|
 | content | 文本内容（媒体已替换为占位符）|
 
+## 对话别名（v2.2.0）
+
+给群聊/私聊起个别名，之后在指令、查询中都可以用别名代替群号/QQ 号。
+
+- **自动登记**：归档过的目标会自动记录群名/好友昵称（有名称后无需手动配置）；
+- **两种管理方式**：
+  - 直接对 bot 说：「给 748791823 加个别名 闲聊群」「把 闲聊群的别名 钓鱼群 删掉」「看看有哪些别名」；
+  - 在 WebUI 插件配置里编辑 `aliases`（每项一条，写法：`别名,群号或QQ号`）。
+- **使用**：例如「归档 闲聊群 昨天的消息」「在 闲聊群 里搜一下晚饭」——插件会自动把别名解析成群号；
+- 别名冲突会给出提示，此时用群号/QQ 号指定即可。
+
 ## LLM 工具
 
 | 工具 | 功能 |
 |---|---|
-| export_group_history(group_id, count) | 按需导出指定群最近 N 条消息（默认 200，最大 5000）|
-| export_private_history(user_id, count) | 按需导出指定好友私聊最近 N 条消息 |
-| export_all_incremental(group_id, start_date, end_date) | 立即归档：默认全部群增量；可指定群号 + 起止日期回溯归档历史 |
-| get_group_message_history(group_id, count) | 读取指定群已归档记录（最近 N 条，时间正序）|
-| search_archived_messages(group_id, keyword, date, user_id, nickname, count) | 在归档记录中搜索（关键词/日期/QQ/昵称，可组合）|
-| list_archived_groups() | 列出已有归档记录的群号 |
+| export_group_history(group_id, count) | 按需导出指定群最近 N 条消息（group_id 支持群号或别名）|
+| export_private_history(user_id, count) | 按需导出指定好友私聊最近 N 条消息（支持 QQ 号或别名）|
+| export_all_incremental(group_id, start_date, end_date) | 立即归档：默认全部群增量；可指定群 + 起止日期回溯归档历史（支持别名）|
+| get_group_message_history(group_id, count) | 读取指定群已归档记录（最近 N 条，时间正序；支持别名）|
+| search_archived_messages(group_id, keyword, date, user_id, nickname, count) | 在归档记录中搜索（关键词/日期/QQ/昵称，可组合；支持别名）|
+| list_archived_groups() | 列出全部归档目标：名称、群号/QQ 号、别名、归档天数与条数 |
+| alias_manage(action, target, alias) | 管理别名：add=新增 / remove=删除 / list=查看（默认）|
 | get_export_status() | 查看自动归档开关、导出目录、游标状态 |
 
 ## 配置（WebUI 可视化）
@@ -102,6 +115,7 @@ archive_bots:
 | whitelist | []（全部）| 自动归档群白名单：仅名单内的群会被定时循环导出；留空=全部群。手动归档不受限 |
 | auto_export_friends | false | 定时模式是否同时导出私聊 |
 | archive_bots | []（全部）| 多 bot 归档白名单：留空=全部 aiocqhttp 实例；填平台实例 id 或登录 QQ 号=只归档指定 bot |
+| aliases | []（空）| 对话别名：每项一条「别名,群号或QQ号」（如 闲聊群,748791823）；也可直接让 bot 管理 |
 | count_per_batch | 50 | 单次 API 拉取条数（1-200）|
 | admin_only | true | 仅管理员可调用 LLM 工具 |
 | auto_clean | true | 自动删除超过保留天数的历史 JSONL（手动归档过的目标除外）|
