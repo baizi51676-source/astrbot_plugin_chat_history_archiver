@@ -163,8 +163,23 @@ async function loadOverview() {
     const d = await apiGet('state');
     state.overview = d;
     renderOverview(d);
+    loadBrief();
   } catch (e) {
     toast('总览加载失败：' + errText(e), true);
+  }
+}
+
+async function loadBrief() {
+  const box = $('brief-text');
+  if (!box) return;
+  try {
+    const res = await apiGet('briefing', { days: state.days, get: 1 });
+    if (res && res.brief) {
+      box.innerHTML = '<div class="summary-title">简报 ' + esc(res.date || '')
+        + '（已缓存）</div><div class="summary-body">' + esc(res.brief) + '</div>';
+    }
+  } catch (e) {
+    /* 没有缓存简报（404）时保持初始提示 */
   }
 }
 
@@ -658,7 +673,7 @@ async function genSummary(force) {
 }
 
 async function showBriefing() {
-  const box = $('summary-text');
+  const box = $('brief-text') || $('summary-text');
   box.innerHTML = '<span class="muted">正在获取简报…</span>';
   try {
     let res = null;

@@ -53,6 +53,14 @@
             <tbody id="targets-body"><tr><td colspan="8" class="muted">加载中…</td></tr></tbody>
           </table>
         </div>
+        <h3 class="sub">昨日简报</h3>
+        <div class="panel">
+          <div class="tools">
+            <button class="ghost" id="btn-brief">生成 / 查看简报</button>
+            <span class="muted">汇总各目标最近的每日总结（限 1000 字）</span>
+          </div>
+          <div class="summary-box" id="brief-text"><span class="muted">尚未生成简报</span></div>
+        </div>
         <p class="muted" id="export-dir"></p>
       </section>
 
@@ -72,13 +80,12 @@
         <div class="panel" id="stat-senders"><div class="muted pad">加载中…</div></div>
         <h3 class="sub">每日时段分布（0-23 时）</h3>
         <div class="panel" id="stat-hourly"><div class="muted pad">加载中…</div></div>
-        <h3 class="sub">LLM 总结 / 简报</h3>
+        <h3 class="sub">LLM 总结（按目标）</h3>
         <div class="panel">
           <div class="tools">
             <button class="ghost" id="btn-sum-gen">总结所选日期</button>
             <label class="chk"><input type="checkbox" id="sum-trend" /> 趋势合并（含最近历史总结）</label>
             <button class="ghost" id="btn-sum-force">重新生成</button>
-            <button class="ghost" id="btn-brief">生成/查看简报</button>
           </div>
           <div class="summary-box" id="summary-text"><span class="muted">尚未生成总结（总结默认关闭，手动触发不产生后台费用）</span></div>
           <div class="sub2">该目标总结历史</div>
