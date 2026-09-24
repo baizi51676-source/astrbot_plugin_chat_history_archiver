@@ -7,9 +7,9 @@
   --text: #17282c;
   --muted: #536b6e;
   --line: rgba(106,167,175,0.38);
-  --glass: rgba(255,255,255,0.68);
+  --glass: rgba(255,255,255,0.62);
   --glass-2: rgba(240,248,249,0.55);
-  --overlay: rgba(240,247,248,0.58);
+  --overlay: rgba(242,248,249,0.42);
   --brand-glow: rgba(34,176,195,0.28);
   --ok: #298e69;
   --warn: #d97c12;
@@ -28,7 +28,7 @@
     --line: rgba(163,205,210,0.2);
     --glass: rgba(17,26,28,0.62);
     --glass-2: rgba(30,43,45,0.55);
-    --overlay: rgba(6,12,14,0.62);
+    --overlay: rgba(6,12,14,0.50);
     --brand-glow: rgba(82,208,224,0.3);
     --ok: #53c69c;
     --warn: #eb9e47;
@@ -48,11 +48,11 @@ body {
 body::before {
   content: "";
   position: fixed;
-  inset: -8vmax;
+  inset: -3vmax;
   z-index: -2;
   background: url("./bg.jpg") center / cover no-repeat;
-  filter: blur(24px) saturate(1.3) brightness(1.02);
-  transform: scale(1.06);
+  filter: blur(8px) saturate(1.16) brightness(1.03);
+  transform: scale(1.03);
   pointer-events: none;
 }
 body::after {
