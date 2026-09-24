@@ -1,6 +1,27 @@
 /* 历史消息归档控制台（总览 / 消息查看 / 配置）
    依赖 AstrBot 自动注入的 window.AstrBotPluginPage bridge。 */
-const bridge = window.AstrBotPluginPage;
+let bridge = window.AstrBotPluginPage;
+
+/* AstrBot 把 bridge SDK 注入在 </body> 前（即本脚本之后），
+   因此这里必须等它加载完成，否则 apiGet/apiPost 全部不可用。 */
+function waitBridge(timeoutMs) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = () => {
+      if (window.AstrBotPluginPage) {
+        bridge = window.AstrBotPluginPage;
+        resolve(true);
+        return;
+      }
+      if (Date.now() - t0 > (timeoutMs || 6000)) {
+        resolve(false);
+        return;
+      }
+      setTimeout(tick, 50);
+    };
+    tick();
+  });
+}
 const $ = (id) => document.getElementById(id);
 
 const FIELDS = [
@@ -257,6 +278,12 @@ async function saveConfig() {
 }
 
 async function boot() {
+  const bridged = await waitBridge(6000);
+  if (!bridged) {
+    $('cards').innerHTML = '<div class="card loading">页面桥接未就绪：请刷新页面重试</div>';
+    toast('页面桥接未就绪：请刷新页面重试', true);
+    return;
+  }
   if (bridge && bridge.ready) {
     try { await bridge.ready(); } catch (e) { /* 旧版 bridge 无 ready 时忽略 */ }
   }
