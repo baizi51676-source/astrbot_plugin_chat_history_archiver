@@ -133,7 +133,7 @@ archive_bots:
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | backend | auto | 后端协议：自动探测 NapCat/SnowLuma，或强制指定 napcat/snowluma |
-| export_dir | data/workspaces/napcat_exports | 导出目录（位于 AstrBot 工作目录下）|
+| export_dir | data/plugin_data/astrbot_plugin_chat_history_archiver | 数据目录：JSONL 归档、游标、别名、头像、总结都放这里（相对路径会被约束在该目录下；也可填绝对路径）|
 | auto_export | true | 自动归档开关：开启后定时循环增量归档 |
 | interval_seconds | 120 | 定时循环间隔（最小 30s）|
 | startup_verify | true | 启动时自动补全缺口：检查最近 N 天归档，自动补齐缺失/不全的记录 |
@@ -156,6 +156,25 @@ archive_bots:
 | llm_briefing_enabled | false | 总览「昨日简报」开关（默认关闭）|
 | llm_summary_max_chars | 1000 | 单群（每个目标）每日总结字数上限（100-5000）|
 | llm_briefing_max_chars | 2000 | 总览简报字数上限（200-8000）|
+
+## 数据目录（v2.3.1 起）
+
+插件的全部持久化数据统一存放在 AstrBot 的插件数据目录：
+
+```
+data/plugin_data/astrbot_plugin_chat_history_archiver/
+├── napcat_<群号>_YYYY-MM-DD.jsonl      # 群聊归档
+├── napcat_private_<QQ号>_*.jsonl      # 私聊归档
+├── state.json                         # 增量游标（去重）
+├── aliases.json                       # 对话别名
+├── names_*.json                       # 昵称映射（@昵称 显示用）
+├── avatars/                           # 发言人头像缓存
+└── summaries/                         # LLM 每日总结与简报
+```
+
+- 该目录在 `data/plugin_data/` 下，会跟随 AstrBot 的**备份/迁移**一起走；
+- **自动迁移**：从旧版本（≤ v2.3.0，数据在 `data/workspaces/napcat_exports`）升级时，插件启动会自动把旧文件搬到新目录，日志中会有 `[astrbot_plugin_chat_history_archiver] 旧数据目录 … 已迁移到 …` 提示；
+- `export_dir` 仍可自定义：**相对路径**会被限制在 `data/plugin_data/<插件名>/` 下；**绝对路径**也支持（例如指向挂载盘），但不在 AstrBot 备份范围内，启动时会有告警提醒。
 
 ## 启动自动补全（归档检查）
 
@@ -208,6 +227,6 @@ plugin i https://github.com/baizi51676-source/astrbot_plugin_chat_history_archiv
 2. 通过 Release zip 手动安装：下载最新 zip 解压后覆盖 AstrBot/data/plugins/ 下插件目录（v2.0.0 起目录名为 astrbot_plugin_chat_history_archiver，若旧目录仍存在请删除），然后在 WebUI 停用→启用一次。
 3. 通过插件市场安装：若旧条目无法检测更新，请卸载旧插件并按新名字重新安装（配置项需重新填写一次）。
 
-升级不影响你的数据：历史 JSONL 归档与游标状态存放在 AstrBot 数据目录的导出目录（默认 data/workspaces/napcat_exports）中，不在插件目录里，覆盖/重装插件不会丢失任何已归档记录。
+升级不影响你的数据：归档与游标等数据存放在 AstrBot 的插件数据目录（默认 data/plugin_data/astrbot_plugin_chat_history_archiver）中，不在插件目录里，覆盖/重装插件不会丢失任何已归档记录；从旧版本升级时，旧目录的数据会**自动迁移**（见下文「数据目录」）。
 
 > 从 v1.4.0 起插件不再与 astrbot_plugin_group_forwarder_special 等外部插件联动搜索；查看/搜索/回溯均已内置为 LLM 工具。

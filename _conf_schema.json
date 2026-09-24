@@ -6,10 +6,10 @@
     "hint": "auto：自动探测 NapCat / SnowLuma（推荐，首次拉到消息后自动识别并缓存）；napcat：强制 NapCat；snowluma：强制 SnowLuma。"
   },
   "export_dir": {
-    "description": "导出目录",
+    "description": "数据目录（插件数据）",
     "type": "string",
-    "default": "data/workspaces/napcat_exports",
-    "hint": "JSONL 文件与游标状态存放位置，相对 AstrBot 工作目录（如 /root/astrbot）。默认位于 data/workspaces/napcat_exports。"
+    "default": "data/plugin_data/astrbot_plugin_chat_history_archiver",
+    "hint": "JSONL 归档、游标、别名、昵称映射、头像与总结的存放位置。默认位于 AstrBot 插件数据目录 data/plugin_data/astrbot_plugin_chat_history_archiver（随 AstrBot 备份/迁移一起走）；相对路径会被限制在该目录下，也可填绝对路径（但不受 AstrBot 备份覆盖）。"
   },
   "auto_export": {
     "description": "自动归档开关",

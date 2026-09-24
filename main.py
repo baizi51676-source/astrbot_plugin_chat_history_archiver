@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import shutil
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -18,7 +20,7 @@ except Exception:  # pragma: no cover - 旧版 AstrBot 无插件页面 API
     _WEB_AVAILABLE = False
 
 PLUGIN_NAME = "astrbot_plugin_chat_history_archiver"
-PLUGIN_VERSION = "2.3.0"
+PLUGIN_VERSION = "2.3.1"
 
 # 消息段类型 → 占位符（不导出媒体文件）
 _SEG_PLACEHOLDER = {
@@ -31,6 +33,123 @@ _SEG_PLACEHOLDER = {
     "json": "[卡片消息]",
     "xml": "[卡片消息]",
 }
+
+# ===== 数据目录（v2.3.1：插件数据统一放在 data/plugin_data/<插件名> 下）=====
+LEGACY_EXPORT_DIR = "data/workspaces/napcat_exports"
+
+
+def _plugin_data_root() -> Path:
+    """返回 AstrBot 的 data/plugin_data 目录（优先官方 API，逐级降级）。"""
+    try:
+        from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+        return Path(get_astrbot_plugin_data_path())
+    except Exception:
+        pass
+    try:
+        from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+        return Path(get_astrbot_data_path()) / "plugin_data"
+    except Exception:
+        pass
+    return Path("data") / "plugin_data"
+
+
+def _plugin_dir_name() -> str:
+    return Path(__file__).resolve().parent.name
+
+
+def _default_export_dir() -> Path:
+    return _plugin_data_root() / _plugin_dir_name()
+
+
+def _legacy_export_dir_path() -> Path:
+    # <root>/data/plugin_data -> <root>/data -> data/workspaces/napcat_exports
+    return _plugin_data_root().parent / "workspaces" / "napcat_exports"
+
+
+def resolve_export_dir(raw):
+    """解析 export_dir 配置。
+
+    规则（v2.3.1，满足插件市场「数据持久化位置」规范）：
+    - 留空或仍是旧默认值 → 用新默认 data/plugin_data/<插件名>（并返回旧目录用于迁移）
+    - 相对路径且落在 data/workspaces/** → 视为旧数据位置，改用新默认并自动迁移
+    - 其它相对路径 → 限制在 data/plugin_data/<插件名>/ 下
+    - 绝对路径 → 原样使用（在 plugin_data 之外会告警）
+
+    返回 (最终目录, 需要迁移的旧目录或 None)
+    """
+    default_dir = _default_export_dir()
+    raw = str(raw or "").strip().replace("\\", "/")
+    if raw in ("", LEGACY_EXPORT_DIR, "./" + LEGACY_EXPORT_DIR,
+               LEGACY_EXPORT_DIR + "/"):
+        return default_dir, _legacy_export_dir_path()
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        try:
+            inside = str(p.resolve()).startswith(
+                str(_plugin_data_root().resolve()))
+        except Exception:
+            inside = False
+        if not inside:
+            logger.warning(
+                f"[{PLUGIN_NAME}] export_dir 位于 plugin_data 之外：{p}；"
+                "该位置不受 AstrBot 备份/迁移覆盖，建议改为 "
+                f"{_plugin_data_root() / _plugin_dir_name()}")
+        return p, None
+    norm = raw[2:] if raw.startswith("./") else raw
+    root = _plugin_data_root().parent.parent  # AstrBot 根目录
+    if norm.startswith("data/"):
+        target = root / norm
+        try:
+            legacy_root = (root / "data" / "workspaces").resolve()
+            if str(target.resolve()).startswith(str(legacy_root)):
+                return default_dir, target
+        except Exception:
+            pass
+        return target, None
+    # 其它相对路径：约束到插件数据目录下
+    return default_dir / norm.strip("/"), None
+
+
+def migrate_dir(src, dst) -> str:
+    """把旧数据目录内容逐项搬到新目录（已存在的项跳过），返回日志文案。"""
+    if src is None:
+        return ""
+    try:
+        src = src.resolve()
+        dst = dst.resolve()
+    except Exception:
+        return ""
+    if src == dst or not src.is_dir():
+        return ""
+    try:
+        items = sorted(src.iterdir())
+    except Exception:
+        return ""
+    if not items:
+        return ""
+    moved = 0
+    skipped = 0
+    for it in items:
+        target = dst / it.name
+        if target.exists():
+            skipped += 1
+            continue
+        try:
+            shutil.move(str(it), str(target))
+            moved += 1
+        except Exception as e:
+            skipped += 1
+            logger.warning(f"[{PLUGIN_NAME}] 迁移 {it} 失败：{e}")
+    try:
+        if not any(src.iterdir()):
+            src.rmdir()
+    except Exception:
+        pass
+    msg = (f"旧数据目录 {src} 已迁移到 {dst}"
+           f"（移动 {moved} 项，跳过 {skipped} 项）")
+    logger.info(f"[{PLUGIN_NAME}] {msg}")
+    return msg
+
 
 
 class NapcatHistoryExporter(Star):
@@ -51,9 +170,12 @@ class NapcatHistoryExporter(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self.export_dir = Path(config.get(
-            "export_dir", "data/workspaces/napcat_exports"))
+        # v2.3.1：插件数据统一放 data/plugin_data/<插件名>（插件市场合规要求）
+        self.export_dir, _legacy_dir = resolve_export_dir(
+            config.get("export_dir", ""))
         self.export_dir.mkdir(parents=True, exist_ok=True)
+        # 旧目录（data/workspaces/napcat_exports）存在时自动迁移
+        self._migrate_msg = migrate_dir(_legacy_dir, self.export_dir)
         self._split_merged_files()  # v1.2.0: v1.1.0 单文件自动拆回按天文件
         self.auto_export = bool(config.get("auto_export", True))
         self.interval = max(30, int(config.get("interval_seconds", 120)))
@@ -1517,6 +1639,8 @@ class NapcatHistoryExporter(Star):
             f"auto 探测结果: {self._backend or '尚未探测'}）",
             f"归档 bot 配置: {self.archive_bots if self.archive_bots else '(全部 aiocqhttp 实例)'}",
             f"导出目录(配置值): {self.export_dir!r}",
+            *([f"数据目录迁移: {self._migrate_msg}"]
+              if getattr(self, "_migrate_msg", "") else []),
             f"导出目录(绝对路径): {exp}",
             f"state.json 路径: {self.state_file.resolve()}",
             f"JSONL 文件数: {len(files)}",
