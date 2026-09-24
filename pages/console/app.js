@@ -431,6 +431,10 @@ async function boot() {
   });
   $('btn-reload-cfg').addEventListener('click', loadConfig);
   $('btn-save-cfg').addEventListener('click', saveConfig);
+  $('btn-names').addEventListener('click', () => {
+    toast('正在刷新成员昵称…');
+    ensureNames(true).then(() => { renderChat(); });
+  });
   $('btn-search').addEventListener('click', runSearch);
   $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') runSearch(); });
   $('btn-archive').addEventListener('click', triggerArchive);
