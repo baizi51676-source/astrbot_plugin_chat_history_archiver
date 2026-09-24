@@ -603,8 +603,12 @@ class NapcatHistoryExporter(Star):
             return "snowluma"
         return "napcat"
 
-    def _segments_to_text(self, segments) -> str:
-        """消息段 → 文本。图片/表情等替换为占位符，不导出媒体。"""
+    def _segments_to_text(self, segments, nickmap=None) -> str:
+        """消息段 → 文本。图片/表情等替换为占位符，不导出媒体。
+
+        v2.3.0：若提供昵称映射（QQ号 → 昵称），@ 消息会渲染为 @昵称，
+        否则保留 [At:QQ号] 占位（页面端会用同一映射再做兜底替换）。
+        """
         if isinstance(segments, str):
             return segments
         parts = []
@@ -616,7 +620,12 @@ class NapcatHistoryExporter(Star):
             if t == "text":
                 parts.append(data.get("text", ""))
             elif t == "at":
-                parts.append(f"[At:{data.get('qq', '')}]")
+                qq = str(data.get("qq", "") or "")
+                nm = (nickmap or {}).get(qq, "")
+                if nm:
+                    parts.append("@" + str(nm))
+                else:
+                    parts.append(f"[At:{qq}]")
             elif t == "file":
                 parts.append(f"[文件:{data.get('name', '')}]")
             elif t in _SEG_PLACEHOLDER:
@@ -625,7 +634,7 @@ class NapcatHistoryExporter(Star):
                 parts.append(f"[{t}]")
         return "".join(parts)
 
-    def _fmt_record(self, msg: dict, chat: str, target_id: str) -> dict:
+    def _fmt_record(self, msg: dict, chat: str, target_id: str, nickmap=None) -> dict:
         """OneBot 消息 → JSONL 行。"""
         sender = msg.get("sender") or {}
         try:
@@ -640,8 +649,37 @@ class NapcatHistoryExporter(Star):
             "user_id": str(sender.get("user_id", "")),
             "nickname": (sender.get("card") or sender.get("nickname") or "").strip(),
             "seq": msg.get("message_seq") or msg.get("message_id") or 0,
-            "content": self._segments_to_text(msg.get("message", "")),
+            "content": self._segments_to_text(msg.get("message", ""), nickmap),
+            "reply": self._reply_of(msg),
         }
+
+    @staticmethod
+    def _reply_of(msg: dict) -> dict | None:
+        """抽取引用（reply）消息信息，供页面“点击跳转”与引用条展示。"""
+        segments = msg.get("message")
+        if isinstance(segments, str):
+            return None
+        for seg in segments or []:
+            if not isinstance(seg, dict):
+                continue
+            if seg.get("type") != "reply":
+                continue
+            data = seg.get("data") or {}
+            out = {}
+            for key in ("id", "message_id", "seq", "text", "qq", "nickname", "time"):
+                val = data.get(key)
+                if val is None or val == "":
+                    continue
+                if key == "time":
+                    try:
+                        out["time"] = datetime.fromtimestamp(int(val)).strftime(
+                            "%Y-%m-%d %H:%M:%S")
+                        continue
+                    except Exception:
+                        pass
+                out[key] = str(val)
+            return out or None
+        return None
 
     def _date_of(self, msg: dict) -> str:
         try:
@@ -1011,10 +1049,22 @@ class NapcatHistoryExporter(Star):
             by_date: dict = {}
             for m in new:
                 by_date.setdefault(self._date_of(m), []).append(m)
+            # v2.3.0：用昵称映射把 @ 渲染为 @昵称，并增量维护映射
+            nickmap = self._nick_map(chat, target_id)
+            nick_dirty = False
+            for m in new:
+                snd = m.get("sender") or {}
+                uid = str(snd.get("user_id", "") or "")
+                nm = str(snd.get("card") or snd.get("nickname") or "").strip()
+                if uid and nm and nickmap.get(uid) != nm:
+                    nickmap[uid] = nm
+                    nick_dirty = True
             for date, msgs in by_date.items():
                 path = self._target_path(chat, target_id, date)
-                records = [self._fmt_record(m, chat, target_id) for m in msgs]
+                records = [self._fmt_record(m, chat, target_id, nickmap) for m in msgs]
                 written += self._merge_write(path, records)  # v2.1.0: 实际新增数
+            if nick_dirty:
+                self._save_nicks(chat, target_id)
             # 更新游标：time 边界 + 最近 5000 个已写 message_id
             max_t = max(self._time_of(m) for m in new)
             new_ids = [self._mid_of(m) for m in new if self._mid_of(m)]
@@ -1741,6 +1791,14 @@ class NapcatHistoryExporter(Star):
             ("console/stats", "GET", self._api_stats, "数据统计"),
             ("console/avatar", "GET", self._api_avatar, "发言人头像"),
             ("console/avatar_file", "GET", self._api_avatar_file, "头像文件"),
+            ("console/search", "GET", self._api_search, "消息搜索"),
+            ("console/members", "GET", self._api_members, "成员昵称映射"),
+            ("console/locate", "GET", self._api_locate, "消息定位（引用跳转）"),
+            ("console/archive", "POST", self._api_archive, "手动触发归档"),
+            ("console/summary", "POST", self._api_summary, "生成每日总结"),
+            ("console/summary_get", "GET", self._api_summary_get, "读取已有总结"),
+            ("console/briefing", "GET", self._api_briefing, "生成/读取简报"),
+            ("console/summary_config", "POST", self._api_summary_config, "保存总结配置"),
             ("console/config", "GET", self._api_config_get, "读取插件配置"),
             ("console/config", "POST", self._api_config_save, "保存插件配置"),
             # 阶段 1 已实测通过的兼容端点
@@ -2167,3 +2225,464 @@ class NapcatHistoryExporter(Star):
             except Exception:
                 pass
         return file_response(str(fp), filename=f"{uid}.png", content_type="image/png")
+
+    # ---------------- v2.3.0：昵称映射（@ 替名 / 引用预览） ----------------
+
+    def _nick_file(self, chat: str, tid: str):
+        prefix = "private_" if chat == "private" else ""
+        return self.export_dir / f"names_{prefix}{tid}.json"
+
+    def _load_nicks(self, chat: str, tid: str) -> dict:
+        cache = getattr(self, "_nick_cache", None)
+        if cache is None:
+            cache = {}
+            self._nick_cache = cache
+        key = f"{chat}:{tid}"
+        if key in cache and isinstance(cache[key], dict):
+            return cache[key]
+        data = {}
+        try:
+            p = self._nick_file(chat, tid)
+            if p.exists():
+                raw = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    data = {str(k): str(v) for k, v in raw.items() if str(v)}
+        except Exception:
+            data = {}
+        cache[key] = data
+        return data
+
+    def _nick_map(self, chat: str, tid: str) -> dict:
+        """返回可直接修改的昵称映射（首次从磁盘加载）。"""
+        return self._load_nicks(chat, tid)
+
+    def _save_nicks(self, chat: str, tid: str) -> None:
+        try:
+            m = self._nick_map(chat, tid)
+            if len(m) > 20000:
+                m = dict(list(m.items())[-20000:])
+                getattr(self, "_nick_cache", {})[f"{chat}:{tid}"] = m
+            self._nick_file(chat, tid).write_text(
+                json.dumps(m, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            logger.error(f"[昵称] 保存映射失败: {e}")
+
+    async def _refresh_members(self, chat: str, tid: str, client) -> int:
+        """尽力拉取群成员/好友列表，把昵称合并进映射（供 @ 与引用预览用）。"""
+        try:
+            if chat == "group":
+                items = await client.call_action("get_group_member_list", group_id=int(tid))
+            else:
+                items = await client.call_action("get_friend_list")
+        except Exception as e:
+            logger.warning(f"[昵称] 拉取成员列表失败: {e}")
+            return 0
+        m = self._nick_map(chat, tid)
+        n = 0
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            uid = str(it.get("user_id", "") or "")
+            nm = str(it.get("card") or it.get("nickname") or "").strip()
+            if uid and nm and m.get(uid) != nm:
+                m[uid] = nm
+                n += 1
+        if n:
+            self._save_nicks(chat, tid)
+            logger.info(f"[昵称] 已更新 {n} 个昵称（{chat}:{tid}）")
+        return n
+
+    # ---------------- v2.3.0：搜索 / 成员 / 引用定位 / 手动归档 / LLM 总结 ----------------
+
+    async def _client_has_group(self, client, tid: str) -> bool:
+        try:
+            groups = await client.call_action("get_group_list") or []
+        except Exception:
+            return False
+        for g in groups:
+            if str(g.get("group_id", "")) == str(tid):
+                return True
+        return False
+
+    async def _api_search(self):
+        q = request.query
+        kw = (q.get("q") or "").strip()
+        user = (q.get("user") or "").strip()
+        start = (q.get("start") or "").strip()
+        end = (q.get("end") or "").strip()
+        try:
+            limit = int(q.get("limit") or 200)
+        except Exception:
+            limit = 200
+        limit = max(1, min(limit, 1000))
+        r, err = self._resolve_chat_target(q)
+        if err:
+            return error_response(err, status_code=400)
+        chat, tid = r
+        hits = []
+        cap = limit * 5
+        for fp in self._target_files(chat, tid):
+            date = fp.name.split("_")[-1][:-6]
+            if start and date < start:
+                continue
+            if end and date > end:
+                continue
+            try:
+                with open(fp, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+                        text = str(rec.get("content") or "")
+                        if kw and kw.lower() not in text.lower():
+                            continue
+                        uid = str(rec.get("user_id") or "")
+                        nick = str(rec.get("nickname") or "")
+                        if user and user not in uid and user.lower() not in nick.lower():
+                            continue
+                        hits.append({
+                            "date": date,
+                            "seq": rec.get("seq"),
+                            "time": rec.get("t", ""),
+                            "sender_id": uid,
+                            "sender_name": nick,
+                            "text": text,
+                        })
+                        if len(hits) >= cap:
+                            break
+            except Exception:
+                continue
+            if len(hits) >= cap:
+                break
+        hits.sort(key=lambda x: x["time"])
+        return json_response({"total": len(hits), "items": hits[-limit:]})
+
+    async def _api_members(self):
+        q = request.query
+        r, err = self._resolve_chat_target(q)
+        if err:
+            return error_response(err, status_code=400)
+        chat, tid = r
+        names = dict(self._nick_map(chat, tid))
+        if (q.get("refresh") or "") in ("1", "true", "yes"):
+            try:
+                clients = await self._get_clients()
+                for _pid, _qq, client in clients:
+                    if chat == "group" and not await self._client_has_group(client, tid):
+                        continue
+                    await self._refresh_members(chat, tid, client)
+                    names = dict(self._nick_map(chat, tid))
+                    break
+            except Exception as e:
+                logger.warning(f"[页面] 刷新成员失败: {e}")
+        return json_response({"names": names})
+
+    async def _api_locate(self):
+        q = request.query
+        r, err = self._resolve_chat_target(q)
+        if err:
+            return error_response(err, status_code=400)
+        chat, tid = r
+        want = str(q.get("seq") or q.get("id") or "").strip()
+        if not want:
+            return error_response("缺少 seq/id 参数", status_code=400)
+        for fp in reversed(self._target_files(chat, tid)):
+            date = fp.name.split("_")[-1][:-6]
+            idx = 0
+            try:
+                with open(fp, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            idx += 1
+                            continue
+                        cands = [str(rec.get("seq") or "")]
+                        rep = rec.get("reply") or {}
+                        if isinstance(rep, dict):
+                            cands.append(str(rep.get("id") or ""))
+                            cands.append(str(rep.get("message_id") or ""))
+                            cands.append(str(rep.get("seq") or ""))
+                        if want in cands:
+                            return json_response({"date": date, "index": idx})
+                        idx += 1
+            except Exception:
+                continue
+        return error_response("未找到该消息", status_code=404)
+
+    async def _api_archive(self):
+        """手动触发一次增量归档（后台执行，不阻塞页面）。"""
+        if getattr(self, "_manual_archiving", False):
+            return json_response({"ok": True, "busy": True})
+        self._manual_archiving = True
+
+        async def run():
+            try:
+                n = await self._auto_export_once()
+                logger.info(f"[页面] 手动触发归档完成，新增 {n} 条")
+            except Exception as e:
+                logger.error(f"[页面] 手动触发归档失败: {e}")
+            finally:
+                self._manual_archiving = False
+
+        asyncio.create_task(run())
+        return json_response({"ok": True, "started": True})
+
+    def _ensure_summary_worker(self):
+        if getattr(self, "_summary_queue", None) is None:
+            self._summary_queue = asyncio.Queue()
+        task = getattr(self, "_summary_task", None)
+        if task is None or task.done():
+            self._summary_task = asyncio.create_task(self._summary_worker())
+
+    async def _summary_worker(self):
+        """总结队列：串行执行，一个完成再下一个。"""
+        q = self._summary_queue
+        while True:
+            job = await q.get()
+            fut = job.get("future")
+            try:
+                if job.get("kind") == "brief":
+                    await self._do_briefing(job)
+                else:
+                    await self._do_summary(job)
+            except Exception as e:
+                logger.error(f"[总结] 任务失败: {e}")
+                if fut is not None and not fut.done():
+                    fut.set_exception(e)
+            finally:
+                if fut is not None and not fut.done():
+                    fut.set_result(job.get("result"))
+                q.task_done()
+
+    def _summary_provider(self):
+        pid = str(self.config.get("llm_summary_provider") or "").strip()
+        if not pid:
+            return None
+        try:
+            return self.context.get_provider_by_id(pid)
+        except Exception:
+            return None
+
+    async def _llm_text(self, prompt: str, system_prompt: str = "") -> str:
+        prov = self._summary_provider()
+        if prov is None:
+            prov = await self.context.get_using_provider_async()
+        if prov is None:
+            raise RuntimeError("没有可用的模型（请先在 AstrBot 里配置模型）")
+        resp = await prov.text_chat(prompt=prompt, system_prompt=system_prompt or None)
+        return (getattr(resp, "completion_text", "") or "").strip()
+
+    def _summary_dir(self, date: str):
+        return self.export_dir / "summaries" / date
+
+    def _summary_path(self, chat: str, tid: str, date: str):
+        prefix = "private_" if chat == "private" else ""
+        return self._summary_dir(date) / f"{prefix}{tid}.md"
+
+    def _day_records(self, chat: str, tid: str, date: str) -> list:
+        fp = self._target_path(chat, tid, date)
+        out = []
+        if not fp.exists():
+            return out
+        try:
+            with open(fp, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    def _records_to_text(records, max_chars: int = 12000) -> str:
+        lines = []
+        for r in records:
+            lines.append(f"[{str(r.get('t',''))[-8:]}] {r.get('nickname','')}: {r.get('content','')}")
+        text = "\n".join(lines)
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n…（过长已截断）"
+        return text
+
+    async def _do_summary(self, job):
+        chat, tid, date = job["chat"], job["tid"], job["date"]
+        records = self._day_records(chat, tid, date)
+        if not records:
+            raise RuntimeError("该日期没有归档消息")
+        label = self._target_label(chat, tid)
+        try:
+            trend_days = int(self.config.get("llm_summary_trend_days", 3) or 3)
+        except Exception:
+            trend_days = 3
+        trend_days = max(1, min(trend_days, 30))
+        history = ""
+        if job.get("trend"):
+            parts = []
+            files = self._target_files(chat, tid)
+            for fp in files[:-1][-trend_days:]:
+                d = fp.name.split("_")[-1][:-6]
+                p = self._summary_path(chat, tid, d)
+                if p.exists():
+                    try:
+                        parts.append(p.read_text(encoding="utf-8"))
+                    except Exception:
+                        pass
+            if parts:
+                history = "\n\n【历史总结】\n" + "\n---\n".join(parts)[-4000:]
+        prompt = (f"以下是「{label}」在 {date} 的聊天记录：\n\n"
+                  + self._records_to_text(records) + history
+                  + "\n\n请用简洁中文总结：1) 主要话题 2) 活跃成员与互动 3) 值得记录的事件或决定"
+                  + (" 4) 与最近几天的趋势变化" if history else "")
+                  + "\n要求：客观叙述，控制在 200 字以内，不要逐条复述消息。")
+        text = await asyncio.wait_for(
+            self._llm_text(prompt, "你是聊天记录整理助手。"), timeout=180)
+        p = self._summary_path(chat, tid, date)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+        except Exception as e:
+            logger.error(f"[总结] 保存失败: {e}")
+        job["result"] = {"summary": text, "date": date,
+                        "target": {"chat": chat, "target": tid, "label": label},
+                        "saved": str(p)}
+
+    async def _do_briefing(self, job):
+        try:
+            days = int(job.get("days") or 3)
+        except Exception:
+            days = 3
+        days = max(1, min(days, 30))
+        dates = []
+        for fn in sorted(self.export_dir.glob("napcat_*.jsonl")):
+            d = fn.name.split("_")[-1][:-6]
+            if len(d) == 10:
+                dates.append(d)
+        dates = sorted(set(dates))[-days:]
+        parts = []
+        for d in dates:
+            folder = self.export_dir / "summaries" / d
+            if not folder.is_dir():
+                continue
+            for p in sorted(folder.glob("*.md")):
+                if p.name == "brief.md":
+                    continue
+                try:
+                    parts.append(f"【{d}｜{p.stem}】" + p.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+        if not parts:
+            raise RuntimeError("还没有每日总结可汇总（请先在「统计」里生成某天总结）")
+        prompt = ("以下是各群/私聊最近的每日总结，请汇总成一份「昨日简报」：\n\n"
+                  + "\n\n".join(parts)[-8000:]
+                  + "\n\n要求：中文、客观，1000 字以内，包含总体活跃度、主要话题、值得关注的事。")
+        text = await asyncio.wait_for(
+            self._llm_text(prompt, "你是社群简报编辑。"), timeout=240)
+        p = self.export_dir / "summaries" / (dates[-1] if dates else "brief") / "brief.md"
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+        except Exception:
+            pass
+        job["result"] = {"brief": text, "days": dates, "saved": str(p)}
+
+    async def _api_summary(self):
+        payload = await request.json(default={})
+        body = payload if isinstance(payload, dict) else {}
+        chat = str(body.get("chat") or "").strip().lower()
+        tid = str(body.get("target_id") or "").strip()
+        date = str(body.get("date") or "").strip()
+        raw = str(body.get("target") or "").strip()
+        trend = bool(body.get("trend"))
+        if chat in ("group", "private") and self._safe_id(tid):
+            target = (chat, tid)
+        elif raw:
+            target, _err = self._resolve_chat_target({"target": raw})
+        else:
+            target = None
+        if not target:
+            return error_response("缺少目标参数（chat+target_id）", status_code=400)
+        chat, tid = target
+        if not date or not self._safe_date(date):
+            return error_response("date 非法（应为 YYYY-MM-DD）", status_code=400)
+        cached = self._summary_path(chat, tid, date)
+        if cached.exists() and not body.get("force"):
+            try:
+                return json_response({"summary": cached.read_text(encoding="utf-8"),
+                                      "date": date, "cached": True})
+            except Exception:
+                pass
+        self._ensure_summary_worker()
+        fut = asyncio.get_running_loop().create_future()
+        job = {"chat": chat, "tid": tid, "date": date, "trend": trend, "future": fut}
+        await self._summary_queue.put(job)
+        try:
+            await asyncio.wait_for(fut, timeout=300)
+        except Exception as e:
+            return error_response(f"总结失败或超时: {e}", status_code=500)
+        res = job.get("result") or {}
+        if not res.get("summary"):
+            return error_response("总结失败", status_code=500)
+        res["cached"] = False
+        return json_response(res)
+
+    async def _api_summary_get(self):
+        q = request.query
+        r, err = self._resolve_chat_target(q)
+        if err:
+            return error_response(err, status_code=400)
+        chat, tid = r
+        items = []
+        for fp in self._target_files(chat, tid):
+            d = fp.name.split("_")[-1][:-6]
+            p = self._summary_path(chat, tid, d)
+            if p.exists():
+                try:
+                    items.append({"date": d, "summary": p.read_text(encoding="utf-8")})
+                except Exception:
+                    pass
+        return json_response({"items": items})
+
+    async def _api_briefing(self):
+        q = request.query
+        try:
+            days = int(q.get("days") or 3)
+        except Exception:
+            days = 3
+        days = max(1, min(days, 30))
+        root = self.export_dir / "summaries"
+        if (q.get("get") or "") in ("1", "true", "yes") and root.is_dir():
+            files = sorted(root.glob("*/brief.md"))
+            if files:
+                try:
+                    return json_response({"brief": files[-1].read_text(encoding="utf-8"),
+                                          "date": files[-1].parent.name, "cached": True})
+                except Exception:
+                    pass
+        self._ensure_summary_worker()
+        fut = asyncio.get_running_loop().create_future()
+        job = {"kind": "brief", "days": days, "future": fut}
+        await self._summary_queue.put(job)
+        try:
+            await asyncio.wait_for(fut, timeout=360)
+        except Exception as e:
+            return error_response(f"简报生成失败或超时: {e}", status_code=500)
+        res = job.get("result") or {}
+        if not res.get("brief"):
+            return error_response("简报生成失败", status_code=500)
+        res["cached"] = False
+        return json_response(res)
+
+    async def _api_summary_config(self):
+        return await self._api_config_save()

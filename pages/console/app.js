@@ -67,6 +67,8 @@ const state = {
   chat: [],
   offset: 0,
   pageSize: 50,
+  names: {},
+  namesKey: '',
 };
 const AVATARS = {};
 
@@ -107,7 +109,7 @@ async function apiPost(path, body) {
   return bridge.apiPost('console/' + path, body || {});
 }
 
-const VIEWS = ['overview', 'messages', 'stats', 'search', 'summary', 'config'];
+const VIEWS = ['overview', 'messages', 'stats', 'search', 'config'];
 const BAR_VIEWS = ['messages', 'stats', 'search'];
 
 function switchView(v) {
@@ -248,20 +250,16 @@ function renderChat() {
     ? state.chat.map(bubble).join('')
     : '<div class="muted pad">该日没有消息</div>';
   if (!state.offset) box.scrollTop = box.scrollHeight;
+  ensureNames(false).then(() => { /* 名称到手后重绘一次 */
+    if (state.namesKey) {
+      const again = state.chat.map(bubble).join("");
+      if (again && again !== box.innerHTML) box.innerHTML = again;
+    }
+  });
   ensureAvatars();
 }
 
-function bubble(m) {
-  const uid = m.sender_id || '';
-  const nick = m.sender_name || uid || '?';
-  const cached = AVATARS[uid];
-  const inner = cached ? '<img class="av-img" src="' + cached + '" alt="" />'
-    : esc(String(nick).slice(0, 1));
-  return '<div class="bubble"><div class="av" data-uid="' + esc(uid) + '">' + inner
-    + '</div><div class="body"><div class="who"><b>' + esc(nick) + '</b> <span>'
-    + esc(m.time || '') + '</span></div><div class="txt">' + esc(m.text || '')
-    + '</div></div></div>';
-}
+/* bubble() 见文件末尾的 v2.3.0 增强段 */
 
 function ensureAvatars() {
   const uids = [];
@@ -336,10 +334,7 @@ function renderStats(d) {
     : '<div class="muted pad">暂无数据</div>';
 }
 
-function stageNotice(boxId, what) {
-  const el = $(boxId);
-  if (el) el.innerHTML = '<div class="muted pad">' + esc(what) + ' 将在下一阶段（阶段 3）上线，当前为阶段 2 测试包。</div>';
-}
+/* 阶段 3 已实现，占位提示函数已移除 */
 
 async function loadConfig() {
   try {
@@ -436,9 +431,18 @@ async function boot() {
   });
   $('btn-reload-cfg').addEventListener('click', loadConfig);
   $('btn-save-cfg').addEventListener('click', saveConfig);
-  $('btn-search').addEventListener('click', () => stageNotice('search-result', '搜索功能'));
-  $('btn-summ-date').addEventListener('click', () => stageNotice('summary-box', 'LLM 总结'));
-  $('btn-briefing').addEventListener('click', () => stageNotice('summary-box', '总览简报'));
+  $('btn-search').addEventListener('click', runSearch);
+  $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') runSearch(); });
+  $('btn-archive').addEventListener('click', triggerArchive);
+  $('btn-sum-gen').addEventListener('click', () => genSummary(false));
+  $('btn-sum-force').addEventListener('click', () => genSummary(true));
+  $('btn-brief').addEventListener('click', showBriefing);
+  document.addEventListener('click', (e) => {
+    const chip = e.target.closest && e.target.closest('.reply-chip');
+    if (chip) { onReplyClick(chip.dataset.reply); return; }
+    const go = e.target.closest && e.target.closest('[data-goto-date]');
+    if (go) { gotoHit(go.dataset.gotoDate, go.dataset.gotoSeq); }
+  });
 
   try {
     const cfg = await apiGet('config');
@@ -451,3 +455,207 @@ async function boot() {
 }
 
 boot();
+
+/* ---------- v2.3.0 增强：@昵称、引用跳转、自己人靠右、搜索、总结 ---------- */
+
+function selfIds() {
+  const raw = state.config.archive_bots;
+  if (Array.isArray(raw)) return raw.map((x) => String(x));
+  if (typeof raw === 'string') return raw.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
+  return [];
+}
+
+function isSelf(uid) {
+  return !!uid && selfIds().indexOf(String(uid)) >= 0;
+}
+
+function textWithAt(text) {
+  return esc(text || '').replace(/\[At:(\d+)\]/g, (m, qq) => {
+    const nm = state.names[qq];
+    return nm ? ('<span class="at">@' + esc(nm) + '</span>')
+      : ('<span class="at">@' + qq + '</span>');
+  });
+}
+
+function replyChip(m) {
+  const rep = m.reply;
+  if (!rep || typeof rep !== 'object') return '';
+  const who = rep.nickname || (rep.qq ? ('QQ' + rep.qq) : '引用消息');
+  const tip = rep.text ? String(rep.text).slice(0, 60) : '';
+  const key = rep.id || rep.message_id || rep.seq || '';
+  return '<div class="reply-chip" data-reply="' + esc(key) + '">引用 ' + esc(who)
+    + (tip ? '：' + esc(tip) : '') + '</div>';
+}
+
+function bubble(m) {
+  const uid = m.sender_id || '';
+  const nick = m.sender_name || uid || '?';
+  const cached = AVATARS[uid];
+  const inner = cached ? '<img class="av-img" src="' + cached + '" alt="" />'
+    : esc(String(nick).slice(0, 1));
+  const cls = isSelf(uid) ? 'bubble self' : 'bubble';
+  return '<div class="' + cls + '" data-seq="' + esc(m.seq == null ? '' : m.seq) + '">'
+    + '<div class="av" data-uid="' + esc(uid) + '">' + inner + '</div>'
+    + '<div class="body"><div class="who"><b>' + esc(nick) + '</b> <span>'
+    + esc(m.time || '') + '</span></div>' + replyChip(m)
+    + '<div class="txt">' + textWithAt(m.text) + '</div></div></div>';
+}
+
+async function ensureNames(refresh) {
+  syncTargetFromSelect();
+  if (!state.target) return;
+  const key = targetKey(state.target);
+  if (!refresh && state.namesKey === key && Object.keys(state.names).length) return;
+  try {
+    const data = await apiGet('members', {
+      chat: state.target.chat,
+      target_id: state.target.target,
+      refresh: refresh ? 1 : 0,
+    });
+    state.names = (data && data.names) || {};
+    state.namesKey = key;
+  } catch (e) {
+    state.names = {};
+  }
+}
+
+async function onReplyClick(key) {
+  if (!key) return;
+  syncTargetFromSelect();
+  if (!state.target) return;
+  toast('正在定位引用消息…');
+  try {
+    const loc = await apiGet('locate', {
+      chat: state.target.chat,
+      target_id: state.target.target,
+      id: key,
+    });
+    if (loc && loc.date) {
+      if (loc.date !== state.date) {
+        const sel = $('sel-date');
+        if (sel && !Array.from(sel.options).some((o) => o.value === loc.date)) {
+          await loadDates();
+        }
+        sel.value = loc.date;
+        state.offset = 0;
+        await loadMessages(true);
+      }
+      highlightAt(loc.index);
+    } else {
+      toast('该引用消息不在归档中', true);
+    }
+  } catch (e) {
+    toast('定位失败：' + errText(e), true);
+  }
+}
+
+function highlightAt(index) {
+  const box = $('chat');
+  if (!box) return;
+  const nodes = box.querySelectorAll('.bubble');
+  if (!nodes.length) return;
+  const total = state.chat.length;
+  let node = null;
+  if (index >= 0 && index < total) node = nodes[Math.max(0, total - 1 - index)] || null;
+  if (!node) return;
+  node.classList.add('hl');
+  node.scrollIntoView({ block: 'center' });
+  setTimeout(() => node.classList.remove('hl'), 2000);
+}
+
+async function runSearch() {
+  syncTargetFromSelect();
+  if (!state.target) {
+    $('search-result').innerHTML = '<div class="muted pad">请先选择目标</div>';
+    return;
+  }
+  const box = $('search-result');
+  box.innerHTML = '<div class="muted pad">搜索中…</div>';
+  try {
+    const data = await apiGet('search', {
+      chat: state.target.chat,
+      target_id: state.target.target,
+      q: $('q').value || '',
+      user: $('q-user').value || '',
+      limit: 200,
+    });
+    const items = (data && data.items) || [];
+    if (!items.length) {
+      box.innerHTML = '<div class="muted pad">没有匹配的消息</div>';
+      return;
+    }
+    box.innerHTML = '<div class="muted pad">共 ' + (data.total || items.length) + ' 条，显示最近 ' + items.length + ' 条</div>'
+      + items.map((m) =>
+        '<div class="hit"><span class="hit-time">' + esc(m.time) + '</span>'
+        + '<b>' + esc(m.sender_name || m.sender_id) + '</b>'
+        + '<span class="hit-text">' + textWithAt(m.text) + '</span>'
+        + '<button class="ghost mini" data-goto-date="' + esc(m.date)
+        + '" data-goto-seq="' + esc(m.seq == null ? '' : m.seq) + '">定位</button></div>').join('');
+  } catch (e) {
+    box.innerHTML = '<div class="muted pad">搜索失败：' + esc(errText(e)) + '</div>';
+  }
+}
+
+async function gotoHit(date, seq) {
+  const sel = $('sel-date');
+  if (sel && !Array.from(sel.options).some((o) => o.value === date)) {
+    await loadDates();
+  }
+  if (sel) sel.value = date;
+  state.offset = 0;
+  await loadMessages(true);
+  switchView('messages');
+  if (seq) setTimeout(() => highlightAt(parseInt(seq, 10)), 300);
+}
+
+async function genSummary(force) {
+  syncTargetFromSelect();
+  if (!state.target) return;
+  const box = $('summary-text');
+  box.innerHTML = '<span class="muted">正在生成…（队列串行，请稍等）</span>';
+  try {
+    const res = await apiPost('summary', {
+      chat: state.target.chat,
+      target_id: state.target.target,
+      date: state.date || ($('sel-date') && $('sel-date').value) || '',
+      trend: !!($('sum-trend') && $('sum-trend').checked),
+      force: !!force,
+    });
+    box.innerHTML = '<div class="summary-title">' + esc((res && res.date) || '')
+      + ((res && res.cached) ? '（已缓存）' : '（新生成）') + '</div>'
+      + '<div class="summary-body">' + esc((res && res.summary) || '') + '</div>';
+  } catch (e) {
+    box.innerHTML = '<span class="muted">总结失败：' + esc(errText(e)) + '</span>';
+  }
+}
+
+async function showBriefing() {
+  const box = $('summary-text');
+  box.innerHTML = '<span class="muted">正在获取简报…</span>';
+  try {
+    let res = null;
+    try {
+      res = await apiGet('briefing', { days: state.days, get: 1 });
+    } catch (e) {
+      res = null;
+    }
+    if (!res || !res.brief) {
+      res = await apiGet('briefing', { days: state.days });
+    }
+    box.innerHTML = '<div class="summary-title">简报 ' + esc((res && res.date) || '')
+      + ((res && res.cached) ? '（已缓存）' : '') + '</div>'
+      + '<div class="summary-body">' + esc((res && res.brief) || '（空）') + '</div>';
+  } catch (e) {
+    box.innerHTML = '<span class="muted">简报失败：' + esc(errText(e)) + '</span>';
+  }
+}
+
+async function triggerArchive() {
+  try {
+    const res = await apiPost('archive', {});
+    toast((res && res.busy) ? '已有归档任务在执行' : '已触发归档，稍后刷新查看');
+    setTimeout(loadOverview, 3000);
+  } catch (e) {
+    toast('触发失败：' + errText(e), true);
+  }
+}

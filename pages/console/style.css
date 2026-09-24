@@ -227,3 +227,47 @@ select:focus, input:focus, textarea:focus { outline: none; border-color: var(--a
   .bar-val { flex: 0 0 46px; }
   .form { grid-template-columns: 1fr; }
 }
+/* 引用条 / @ / 自己人靠右 / 高亮 / 总结框 / 搜索结果 */
+.bubble.self { flex-direction: row-reverse; }
+.bubble.self .body { text-align: right; }
+.bubble.self .who { justify-content: flex-end; }
+.bubble.self .txt { background: var(--accent); border-color: var(--accent); color: #fff; }
+.reply-chip {
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--panel-2);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 3px 8px;
+  margin-bottom: 4px;
+  cursor: pointer;
+  max-width: 62ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.reply-chip:hover { color: var(--text); }
+.at { color: var(--accent); }
+.bubble.hl .txt { box-shadow: 0 0 0 2px var(--accent); }
+.summary-box {
+  margin-top: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.summary-title { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.summary-body { white-space: pre-wrap; line-height: 1.65; }
+.hit {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+.hit:last-child { border-bottom: 0; }
+.hit-time { color: var(--muted); font-size: 12px; flex: 0 0 140px; }
+.hit-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+button.mini { padding: 3px 8px; font-size: 12px; }
+.chk { color: var(--muted); font-size: 12px; display: inline-flex; align-items: center; gap: 4px; }
