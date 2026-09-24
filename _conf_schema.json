@@ -130,5 +130,17 @@
     "type": "bool",
     "default": false,
     "hint": "开启后在总览生成「昨日简报」（汇总各目标总结）"
+  },
+  "llm_summary_max_chars": {
+    "description": "单群总结字数上限",
+    "type": "int",
+    "default": 1000,
+    "hint": "每个目标每日总结的字数上限（100-5000，默认 1000）"
+  },
+  "llm_briefing_max_chars": {
+    "description": "简报字数上限",
+    "type": "int",
+    "default": 2000,
+    "hint": "总览「昨日简报」的字数上限（200-8000，默认 2000）"
   }
 }

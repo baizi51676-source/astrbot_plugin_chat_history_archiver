@@ -51,6 +51,8 @@ const FIELDS = [
   { key: 'llm_summary_time', label: '自动总结时间', type: 'text', hint: 'HH:MM' },
   { key: 'llm_summary_trend_days', label: '趋势合并天数', type: 'int', hint: '1-30' },
   { key: 'llm_briefing_enabled', label: '总览简报', type: 'bool', hint: '默认关闭' },
+  { key: 'llm_summary_max_chars', label: '单群总结字数', type: 'int', hint: '默认 1000（100-5000）' },
+  { key: 'llm_briefing_max_chars', label: '简报字数', type: 'int', hint: '默认 2000（200-8000）' },
 ];
 
 const AMP = String.fromCharCode(38);

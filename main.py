@@ -1772,6 +1772,8 @@ class NapcatHistoryExporter(Star):
         ("llm_summary_time", "str"),
         ("llm_summary_trend_days", "int"),
         ("llm_briefing_enabled", "bool"),
+        ("llm_summary_max_chars", "int"),
+        ("llm_briefing_max_chars", "int"),
     ]
 
     def _register_web_apis(self) -> None:
@@ -2541,11 +2543,16 @@ class NapcatHistoryExporter(Star):
                         pass
             if parts:
                 history = "\n\n【历史总结】\n" + "\n---\n".join(parts)[-4000:]
+        try:
+            max_chars = int(self.config.get("llm_summary_max_chars", 1000) or 1000)
+        except Exception:
+            max_chars = 1000
+        max_chars = max(100, min(max_chars, 5000))
         prompt = (f"以下是「{label}」在 {date} 的聊天记录：\n\n"
                   + self._records_to_text(records) + history
                   + "\n\n请用简洁中文总结：1) 主要话题 2) 活跃成员与互动 3) 值得记录的事件或决定"
                   + (" 4) 与最近几天的趋势变化" if history else "")
-                  + "\n要求：客观叙述，控制在 200 字以内，不要逐条复述消息。")
+                  + f"\n要求：客观叙述，控制在 {max_chars} 字以内，不要逐条复述消息。")
         text = await asyncio.wait_for(
             self._llm_text(prompt, "你是聊天记录整理助手。"), timeout=180)
         p = self._summary_path(chat, tid, date)
@@ -2584,9 +2591,14 @@ class NapcatHistoryExporter(Star):
                     pass
         if not parts:
             raise RuntimeError("还没有每日总结可汇总（请先在「统计」里生成某天总结）")
+        try:
+            max_chars = int(self.config.get("llm_briefing_max_chars", 2000) or 2000)
+        except Exception:
+            max_chars = 2000
+        max_chars = max(200, min(max_chars, 8000))
         prompt = ("以下是各群/私聊最近的每日总结，请汇总成一份「昨日简报」：\n\n"
                   + "\n\n".join(parts)[-8000:]
-                  + "\n\n要求：中文、客观，1000 字以内，包含总体活跃度、主要话题、值得关注的事。")
+                  + f"\n\n要求：中文、客观，{max_chars} 字以内，包含总体活跃度、主要话题、值得关注的事。")
         text = await asyncio.wait_for(
             self._llm_text(prompt, "你是社群简报编辑。"), timeout=240)
         p = self.export_dir / "summaries" / (dates[-1] if dates else "brief") / "brief.md"
