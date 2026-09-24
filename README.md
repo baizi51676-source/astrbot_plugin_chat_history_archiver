@@ -84,7 +84,7 @@ archive_bots:
 
 - **自动登记**：归档过的目标会自动记录群名/好友昵称（有名称后无需手动配置）；
 - **两种管理方式**：
-  - 直接对 bot 说：「给 748791823 加个别名 闲聊群」「把 闲聊群的别名 钓鱼群 删掉」「看看有哪些别名」；
+  - 直接对 bot 说：「给 748791823 加个别名 闲聊群」「把 闲聊群的别名 改成 摸鱼群」「把 闲聊群的别名 钓鱼群 删掉」「看看有哪些别名」；
   - 在 WebUI 插件配置里编辑 `aliases`（每项一条，写法：`别名,群号或QQ号`）。
 - **使用**：例如「归档 闲聊群 昨天的消息」「在 闲聊群 里搜一下晚饭」——插件会自动把别名解析成群号；
 - 别名冲突会给出提示，此时用群号/QQ 号指定即可。
@@ -99,7 +99,7 @@ archive_bots:
 | get_group_message_history(group_id, count) | 读取指定群已归档记录（最近 N 条，时间正序；支持别名）|
 | search_archived_messages(group_id, keyword, date, user_id, nickname, count) | 在归档记录中搜索（关键词/日期/QQ/昵称，可组合；支持别名）|
 | list_archived_groups() | 列出全部归档目标：名称、群号/QQ 号、别名、归档天数与条数 |
-| alias_manage(action, target, alias) | 管理别名：add=新增 / remove=删除 / list=查看（默认）|
+| alias_manage(action, target, alias, new_alias) | 管理别名：add=新增 / rename=修改（alias 填旧别名，new_alias 填新别名）/ remove=删除 / list=查看（默认）|
 | get_export_status() | 查看自动归档开关、导出目录、游标状态 |
 
 ## 配置（WebUI 可视化）

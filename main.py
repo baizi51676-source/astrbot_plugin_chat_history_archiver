@@ -195,6 +195,37 @@ class NapcatHistoryExporter(Star):
         ent["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._save_aliases()
         return None
+    def _alias_rename(self, chat: str, tid: str, old: str, new: str):
+        """修改别名（把 old 改成 new）。返回错误信息；成功返回 None。"""
+        old = (old or "").strip()
+        new = (new or "").strip()
+        if not old or not new:
+            return "修改别名需要提供「旧别名」和「新别名」"
+        if old == new:
+            return "新别名与旧别名相同，无需修改"
+        if new.isdigit():
+            return "别名不能是纯数字（会与群号/QQ号冲突）"
+        ent = self._alias_entry(chat, tid)
+        if ent is None:
+            return "该目标还没有登记（先归档一次或添加别名）"
+        aliases = ent.get("aliases") or []
+        if old not in aliases:
+            return (f"该目标没有别名「{old}」"
+                    f"（当前：{'、'.join(aliases) if aliases else '无'}）")
+        for c, bucket in self.aliases.items():
+            for t, ent2 in (bucket or {}).items():
+                if not isinstance(ent2, dict):
+                    continue
+                if c == chat and str(t) == str(tid):
+                    continue
+                if new in (ent2.get("aliases") or []):
+                    return f"别名「{new}」已被 {self._target_label(c, t)} 使用"
+        if new in aliases:
+            return f"本目标已有别名「{new}」（可先删除「{old}」）"
+        aliases[aliases.index(old)] = new
+        ent["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._save_aliases()
+        return None
 
     def _resolve_target(self, text: str, prefer_chat: str = ""):
         """把「群号 / QQ号 / 别名」解析为 (chat, tid)。
@@ -1597,14 +1628,16 @@ class NapcatHistoryExporter(Star):
     @filter.llm_tool("alias_manage")
     async def alias_manage(self, event: AstrMessageEvent,
                            action: str = "list",
-                           target: str = "", alias: str = ""):
+                           target: str = "", alias: str = "",
+                           new_alias: str = ""):
         '''
         管理归档目标的别名：别名可替代群号/QQ号用于归档、查询等指令。
 
         Args:
-          action(string): 操作：add=新增别名，remove=删除别名，list=查看全部（默认 list）
-          target(string): 目标：群号 / QQ号 / 已有别名（add/remove 必填）
-          alias(string): 要新增或删除的别名（add/remove 必填）
+          action(string): 操作：add=新增别名，remove=删除别名，rename=修改别名，list=查看全部（默认 list）
+          target(string): 目标：群号 / QQ号 / 已有别名（除 list 外必填）
+          alias(string): 别名（add/remove 必填；rename 时填「旧别名」）
+          new_alias(string): 新别名（仅 rename 必填）
 
         返回: 操作结果或别名列表
         '''
@@ -1613,8 +1646,8 @@ class NapcatHistoryExporter(Star):
         act = (action or "list").strip().lower()
         if act in ("", "list", "ls", "查看"):
             return self._alias_list_text()
-        if act not in ("add", "remove", "del", "delete", "新增", "删除"):
-            return f"❌ 未知操作「{action}」，可用：add / remove / list"
+        if act not in ("add", "remove", "del", "delete", "rename", "modify", "新增", "删除", "修改", "重命名"):
+            return f"❌ 未知操作「{action}」，可用：add / remove / rename / list"
         if not target.strip():
             return "❌ 请提供目标（群号 / QQ号 / 已有别名）"
         if not alias.strip():
@@ -1626,14 +1659,23 @@ class NapcatHistoryExporter(Star):
         if isinstance(r, tuple) and len(r) == 2 and r[0] == "AMBIGUOUS":
             return self._alias_hint(target)
         chat, tid = r
+        if act in ("rename", "modify", "修改", "重命名") and not (new_alias or "").strip():
+            return "❌ 修改别名请提供新别名（new_alias 参数）"
         if act in ("add", "新增"):
             err = self._alias_add(chat, tid, alias)
+        elif act in ("rename", "modify", "修改", "重命名"):
+            err = self._alias_rename(chat, tid, alias, new_alias)
         else:
             err = self._alias_remove(chat, tid, alias)
         if err:
             return f"❌ {err}"
         await self._flush_alias_config()
         cur = self._aliases_of(chat, tid)
-        return (f"✅ 已{'新增' if act in ('add', '新增') else '删除'}"
-                f"别名「{alias.strip()}」→ {self._target_label(chat, tid)}\n"
+        if act in ("rename", "modify", "修改", "重命名"):
+            verb = "修改（%s → %s）" % (alias.strip(), (new_alias or "").strip())
+        elif act in ("add", "新增"):
+            verb = "新增「%s」" % alias.strip()
+        else:
+            verb = "删除「%s」" % alias.strip()
+        return (f"✅ 已{verb} → {self._target_label(chat, tid)}\n"
                 f"当前别名：{'、'.join(cur) if cur else '（无）'}")
