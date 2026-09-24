@@ -82,5 +82,53 @@
     "type": "int",
     "default": 14,
     "hint": "仅保留最近 N 天的历史文件，更早的自动删除。手动归档过的目标文件不清理。"
+  },
+  "ui_default_tab": {
+    "description": "默认打开页面",
+    "type": "string",
+    "default": "overview",
+    "hint": "控制台打开时默认显示的标签：overview=总览 / messages=消息查看 / stats=统计 / config=配置"
+  },
+  "ui_messages_page_size": {
+    "description": "消息分页大小",
+    "type": "int",
+    "default": 50,
+    "hint": "控制台消息查看每页加载条数（10-500）"
+  },
+  "ui_avatar_cache": {
+    "description": "缓存发言人头像",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后把发言人头像缓存到导出目录的 avatars/ 文件夹（7 天更新）"
+  },
+  "llm_summary_enabled": {
+    "description": "LLM 每日总结（默认关闭）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后按设定时间自动对当天消息生成总结（会产生模型费用）"
+  },
+  "llm_summary_provider": {
+    "description": "总结用模型",
+    "type": "string",
+    "default": "",
+    "hint": "留空 = 使用聊天主模型；也可填写已配置的模型 id"
+  },
+  "llm_summary_time": {
+    "description": "自动总结时间",
+    "type": "string",
+    "default": "23:30",
+    "hint": "格式 HH:MM，建议放在当天消息基本结束之后"
+  },
+  "llm_summary_trend_days": {
+    "description": "趋势合并天数",
+    "type": "int",
+    "default": 3,
+    "hint": "趋势模式下，把最近 N 天的历史总结与当日消息一起总结（1-30）"
+  },
+  "llm_briefing_enabled": {
+    "description": "总览简报（默认关闭）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后在总览生成「昨日简报」（汇总各目标总结）"
   }
 }

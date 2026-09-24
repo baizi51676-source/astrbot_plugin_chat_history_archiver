@@ -13,11 +13,28 @@
       <nav>
         <button class="nav-btn active" data-view="overview">总览</button>
         <button class="nav-btn" data-view="messages">消息查看</button>
+        <button class="nav-btn" data-view="stats">统计</button>
+        <button class="nav-btn" data-view="search">搜索</button>
+        <button class="nav-btn" data-view="summary">总结</button>
         <button class="nav-btn" data-view="config">配置</button>
       </nav>
       <div class="side-foot" id="foot-ver">—</div>
     </aside>
+
     <main class="main">
+      <div class="topbar hidden" id="topbar">
+        <select id="sel-target"></select>
+        <select id="sel-date"></select>
+        <select id="sel-days" class="hidden">
+          <option value="7">最近 7 天</option>
+          <option value="30" selected>最近 30 天</option>
+          <option value="90">最近 90 天</option>
+          <option value="365">最近 1 年</option>
+        </select>
+        <button class="ghost" id="btn-reload">加载</button>
+        <span class="muted" id="bar-hint"></span>
+      </div>
+
       <section id="view-overview" class="view">
         <div class="view-head">
           <h2>总览</h2>
@@ -37,17 +54,44 @@
       </section>
 
       <section id="view-messages" class="view hidden">
+        <div class="view-head"><h2>消息查看</h2></div>
+        <div class="msg-meta muted" id="msg-meta"></div>
+        <div class="chat" id="chat"><div class="muted pad">选择目标后点击「加载」</div></div>
+        <div class="pager"><button class="ghost" id="btn-more">加载更早</button></div>
+      </section>
+
+      <section id="view-stats" class="view hidden">
+        <div class="view-head"><h2>统计</h2></div>
+        <div class="cards" id="stat-cards"><div class="card loading">加载中…</div></div>
+        <h3 class="sub">每日消息量</h3>
+        <div class="panel" id="stat-daily"><div class="muted pad">加载中…</div></div>
+        <h3 class="sub">活跃发言人 Top 10</h3>
+        <div class="panel" id="stat-senders"><div class="muted pad">加载中…</div></div>
+        <h3 class="sub">每日时段分布（0-23 时）</h3>
+        <div class="panel" id="stat-hourly"><div class="muted pad">加载中…</div></div>
+      </section>
+
+      <section id="view-search" class="view hidden">
         <div class="view-head">
-          <h2>消息查看</h2>
+          <h2>搜索</h2>
           <div class="tools">
-            <select id="msg-target"></select>
-            <select id="msg-date"></select>
-            <button class="ghost" id="btn-load-msg">加载</button>
+            <input type="text" id="q" placeholder="关键词（可选）" />
+            <input type="text" id="q-user" placeholder="发送者 QQ / 昵称（可选）" />
+            <button class="primary" id="btn-search">搜索</button>
           </div>
         </div>
-        <div class="msg-meta muted" id="msg-meta"></div>
-        <div class="chat" id="chat"><div class="muted pad">选择目标与日期后点击「加载」</div></div>
-        <div class="pager"><button class="ghost" id="btn-more">加载更早</button></div>
+        <div class="panel" id="search-result"><div class="muted pad">输入条件后点击「搜索」</div></div>
+      </section>
+
+      <section id="view-summary" class="view hidden">
+        <div class="view-head">
+          <h2>总结</h2>
+          <div class="tools">
+            <button class="ghost" id="btn-summ-date">总结所选日期</button>
+            <button class="ghost" id="btn-briefing">查看简报</button>
+          </div>
+        </div>
+        <div class="panel" id="summary-box"><div class="muted pad">LLM 总结默认关闭；可在「配置」里开启或直接手动触发一次。</div></div>
       </section>
 
       <section id="view-config" class="view hidden">

@@ -1714,6 +1714,14 @@ class NapcatHistoryExporter(Star):
         ("admin_only", "bool"),
         ("auto_clean", "bool"),
         ("clean_days", "int"),
+        ("ui_default_tab", "str"),
+        ("ui_messages_page_size", "int"),
+        ("ui_avatar_cache", "bool"),
+        ("llm_summary_enabled", "bool"),
+        ("llm_summary_provider", "str"),
+        ("llm_summary_time", "str"),
+        ("llm_summary_trend_days", "int"),
+        ("llm_briefing_enabled", "bool"),
     ]
 
     def _register_web_apis(self) -> None:
@@ -1726,11 +1734,21 @@ class NapcatHistoryExporter(Star):
             logger.warning("[页面] context.register_web_api 不可用，控制台不可用。")
             return
         routes = [
-            ("state", "GET", self._api_state, "总览统计"),
-            ("targets", "GET", self._api_targets, "归档目标列表"),
-            ("messages", "GET", self._api_messages, "读取归档消息"),
-            ("config", "GET", self._api_config_get, "读取插件配置"),
-            ("config", "POST", self._api_config_save, "保存插件配置"),
+            ("console/state", "GET", self._api_state, "总览统计"),
+            ("console/targets", "GET", self._api_targets, "归档目标列表"),
+            ("console/messages", "GET", self._api_messages, "读取归档消息"),
+            ("console/dates", "GET", self._api_dates, "归档日期列表"),
+            ("console/stats", "GET", self._api_stats, "数据统计"),
+            ("console/avatar", "GET", self._api_avatar, "发言人头像"),
+            ("console/avatar_file", "GET", self._api_avatar_file, "头像文件"),
+            ("console/config", "GET", self._api_config_get, "读取插件配置"),
+            ("console/config", "POST", self._api_config_save, "保存插件配置"),
+            # 阶段 1 已实测通过的兼容端点
+            ("state", "GET", self._api_state, "总览统计（兼容）"),
+            ("targets", "GET", self._api_targets, "归档目标列表（兼容）"),
+            ("messages", "GET", self._api_messages, "读取归档消息（兼容）"),
+            ("config", "GET", self._api_config_get, "读取配置（兼容）"),
+            ("config", "POST", self._api_config_save, "保存配置（兼容）"),
         ]
         for route, method, handler, desc in routes:
             try:
@@ -1837,6 +1855,8 @@ class NapcatHistoryExporter(Star):
         q = request.query
         raw = (q.get("target") or "").strip()
         date = (q.get("date") or "").strip()
+        if date and not self._safe_date(date):
+            return error_response("date 非法（应为 YYYY-MM-DD）", status_code=400)
         try:
             limit = int(q.get("limit") or 200)
         except Exception:
@@ -1846,13 +1866,9 @@ class NapcatHistoryExporter(Star):
             offset = int(q.get("offset") or 0)
         except Exception:
             offset = 0
-        if not raw:
-            return error_response("缺少 target 参数", status_code=400)
-        r = self._resolve_target(raw)
-        if r is None:
-            return error_response(f"未找到目标「{raw}」", status_code=404)
-        if isinstance(r, tuple) and len(r) == 2 and r[0] == "AMBIGUOUS":
-            return error_response(self._alias_hint(raw), status_code=400)
+        r, terr = self._resolve_chat_target(q)
+        if terr:
+            return error_response(terr, status_code=400)
         chat, tid = r
         files = self._target_files(chat, tid)
         dates = [fp.name.split("_")[-1][:-6] for fp in files]
@@ -1880,13 +1896,26 @@ class NapcatHistoryExporter(Star):
         total = len(records)
         end = max(0, total - offset)
         start = max(0, end - limit)
+        page = records[start:end]
+        items = []
+        for rec in page:
+            items.append({
+                "seq": rec.get("seq"),
+                "time": rec.get("t", ""),
+                "sender_id": str(rec.get("user_id") or ""),
+                "sender_name": rec.get("nickname") or "",
+                "text": rec.get("content") or "",
+                "type": rec.get("chat") or chat,
+            })
         return json_response({
             "target": info,
             "dates": dates,
             "date": date,
             "total": total,
             "offset": offset,
-            "messages": records[start:end],
+            "has_more": start > 0,
+            "messages": page,
+            "items": items,
         })
 
     async def _api_config_get(self):
@@ -1952,3 +1981,189 @@ class NapcatHistoryExporter(Star):
         except Exception as e:
             logger.error(f"[页面] 同步别名配置失败: {e}")
         return json_response({"ok": True, "saved": sorted(cleaned.keys())})
+
+    # ---------------- 阶段 2：日期 / 统计 / 头像 ----------------
+
+    @staticmethod
+    def _safe_id(v) -> bool:
+        v = (v or "").strip()
+        return bool(v) and v.isdigit() and len(v) <= 20
+
+    @staticmethod
+    def _safe_date(v) -> bool:
+        v = (v or "").strip()
+        if len(v) != 10 or v[4] != "-" or v[7] != "-":
+            return False
+        return all(c.isdigit() or c == "-" for c in v)
+
+    def _resolve_chat_target(self, q):
+        """从 query 解析 (chat, tid)：支持 chat+target_id，或 target(群号/QQ/别名)。
+        返回 ((chat, tid), None) 或 (None, 错误信息)。"""
+        chat_q = (q.get("chat") or "").strip().lower()
+        tid_q = (q.get("target_id") or "").strip()
+        raw = (q.get("target") or "").strip()
+        if chat_q in ("group", "private") and tid_q:
+            if not self._safe_id(tid_q):
+                return None, "target_id 非法（应为纯数字）"
+            return (chat_q, str(tid_q)), None
+        if raw:
+            r = self._resolve_target(raw)
+            if r is None:
+                return None, f"未找到目标「{raw}」"
+            if isinstance(r, tuple) and len(r) == 2 and r[0] == "AMBIGUOUS":
+                return None, self._alias_hint(raw)
+            return r, None
+        return None, "缺少 target 或 chat+target_id 参数"
+
+    async def _api_dates(self):
+        q = request.query
+        r, err = self._resolve_chat_target(q)
+        if err:
+            return error_response(err, status_code=400)
+        chat, tid = r
+        out = []
+        for fp in self._target_files(chat, tid):
+            date = fp.name.split("_")[-1][:-6]
+            try:
+                size = fp.stat().st_size
+            except Exception:
+                size = 0
+            out.append({"date": date, "count": self._count_rows_cached([fp]), "size": size})
+        return json_response({
+            "target": {"chat": chat, "target": tid, "label": self._target_label(chat, tid)},
+            "dates": out,
+        })
+
+    async def _api_stats(self):
+        q = request.query
+        r, err = self._resolve_chat_target(q)
+        if err:
+            return error_response(err, status_code=400)
+        chat, tid = r
+        try:
+            days = int(q.get("days") or 30)
+        except Exception:
+            days = 30
+        days = max(1, min(days, 365))
+        files = self._target_files(chat, tid)
+        recent = files[-days:] if len(files) > days else files
+        daily = []
+        by_sender = {}
+        hourly = [0] * 24
+        total = 0
+        for fp in recent:
+            date = fp.name.split("_")[-1][:-6]
+            n = 0
+            try:
+                with open(fp, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        n += 1
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+                        uid = str(rec.get("user_id") or "")
+                        if uid:
+                            item = by_sender.setdefault(
+                                uid, {"user_id": uid, "sender_name": "", "count": 0})
+                            item["count"] += 1
+                            if not item["sender_name"]:
+                                item["sender_name"] = str(rec.get("nickname") or "")
+                        t = str(rec.get("t") or "")
+                        if len(t) >= 13:
+                            try:
+                                hh = int(t[11:13])
+                                if 0 <= hh < 24:
+                                    hourly[hh] += 1
+                            except Exception:
+                                pass
+            except Exception:
+                continue
+            daily.append({"date": date, "count": n})
+            total += n
+        top = sorted(by_sender.values(), key=lambda x: -x["count"])[:10]
+        return json_response({
+            "target": {"chat": chat, "target": tid, "label": self._target_label(chat, tid)},
+            "days": len(recent),
+            "total": total,
+            "daily": daily,
+            "top_senders": top,
+            "hourly": hourly,
+        })
+
+    @staticmethod
+    def _download_avatar(uid: str):
+        """同步下载 QQ 头像（在线程中执行）；失败返回 None。"""
+        import urllib.request
+        url = f"https://q1.qlogo.cn/g?b=qq&nk={uid}&s=100"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                if getattr(resp, "status", 200) != 200:
+                    return None
+                data = resp.read(300 * 1024 + 1)
+            if not data or len(data) > 300 * 1024:
+                return None
+            return data
+        except Exception:
+            return None
+
+    def _avatar_path(self, uid: str):
+        return self.export_dir / "avatars" / f"{uid}.png"
+
+    async def _load_avatar_bytes(self, uid: str, use_cache: bool):
+        """优先读缓存，否则下载并写缓存；返回 bytes 或 None。"""
+        fp = self._avatar_path(uid)
+        if use_cache:
+            try:
+                if fp.exists() and (time.time() - fp.stat().st_mtime) < 7 * 86400:
+                    return fp.read_bytes()
+            except Exception:
+                pass
+        data = await asyncio.to_thread(self._download_avatar, uid)
+        if data and use_cache:
+            try:
+                fp.parent.mkdir(parents=True, exist_ok=True)
+                fp.write_bytes(data)
+            except Exception:
+                pass
+        return data
+
+    async def _api_avatar(self):
+        """头像（JSON + base64 data URL）：受限 iframe 内 <img> 可直接使用。"""
+        q = request.query
+        uid = (q.get("user_id") or "").strip()
+        if not self._safe_id(uid):
+            return error_response("user_id 非法", status_code=400)
+        use_cache = bool(self.config.get("ui_avatar_cache", True))
+        data = await self._load_avatar_bytes(uid, use_cache)
+        if not data:
+            return json_response({"user_id": uid, "data_url": "", "cached": False})
+        import base64
+        return json_response({
+            "user_id": uid,
+            "data_url": "data:image/png;base64," + base64.b64encode(data).decode("ascii"),
+            "cached": use_cache,
+        })
+
+    async def _api_avatar_file(self):
+        """头像文件（file_response）：供直接下载或另存使用。"""
+        q = request.query
+        uid = (q.get("user_id") or "").strip()
+        if not self._safe_id(uid):
+            return error_response("user_id 非法", status_code=400)
+        use_cache = bool(self.config.get("ui_avatar_cache", True))
+        data = await self._load_avatar_bytes(uid, use_cache)
+        if not data:
+            return error_response("头像获取失败", status_code=404)
+        fp = self._avatar_path(uid)
+        if not fp.exists():
+            try:
+                fp.parent.mkdir(parents=True, exist_ok=True)
+                fp.write_bytes(data)
+            except Exception:
+                pass
+        return file_response(str(fp), filename=f"{uid}.png", content_type="image/png")
