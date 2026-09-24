@@ -7,6 +7,18 @@ from pathlib import Path
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
+try:
+    from astrbot.api.web import (
+        error_response,
+        json_response,
+        request,
+    )
+    _WEB_AVAILABLE = True
+except Exception:  # pragma: no cover - 旧版 AstrBot 无插件页面 API
+    _WEB_AVAILABLE = False
+
+PLUGIN_NAME = "astrbot_plugin_chat_history_archiver"
+PLUGIN_VERSION = "2.3.0"
 
 # 消息段类型 → 占位符（不导出媒体文件）
 _SEG_PLACEHOLDER = {
@@ -1259,6 +1271,11 @@ class NapcatHistoryExporter(Star):
             asyncio.create_task(self._refresh_names_safe())
         except Exception as e:
             logger.error(f"[别名] 初始化异常: {e}")
+        # v2.3.0: 注册插件页面（控制台）API
+        try:
+            self._register_web_apis()
+        except Exception as e:
+            logger.error(f"[页面] 注册 Web API 失败: {e}")
         if self.auto_export:
             self._task = asyncio.create_task(self._auto_loop())
             logger.info("NapCat 历史导出器已启动自动归档（每 %ss 增量导出一次，"
@@ -1679,3 +1696,259 @@ class NapcatHistoryExporter(Star):
             verb = "删除「%s」" % alias.strip()
         return (f"✅ 已{verb} → {self._target_label(chat, tid)}\n"
                 f"当前别名：{'、'.join(cur) if cur else '（无）'}")
+
+    # ---------------- v2.3.0: 插件页面（控制台）API ----------------
+
+    _PAGE_CONFIG_FIELDS = [
+        ("backend", "str"),
+        ("export_dir", "str"),
+        ("auto_export", "bool"),
+        ("interval_seconds", "int"),
+        ("startup_verify", "bool"),
+        ("verify_days", "int"),
+        ("whitelist", "list"),
+        ("auto_export_friends", "bool"),
+        ("archive_bots", "list"),
+        ("aliases", "list"),
+        ("count_per_batch", "int"),
+        ("admin_only", "bool"),
+        ("auto_clean", "bool"),
+        ("clean_days", "int"),
+    ]
+
+    def _register_web_apis(self) -> None:
+        """向 AstrBot 注册控制台页面后端 API（旧版本自动跳过）。"""
+        if not _WEB_AVAILABLE:
+            logger.warning("[页面] 当前 AstrBot 版本缺少插件页面 API，控制台不可用。")
+            return
+        register = getattr(self.context, "register_web_api", None)
+        if not callable(register):
+            logger.warning("[页面] context.register_web_api 不可用，控制台不可用。")
+            return
+        routes = [
+            ("state", "GET", self._api_state, "总览统计"),
+            ("targets", "GET", self._api_targets, "归档目标列表"),
+            ("messages", "GET", self._api_messages, "读取归档消息"),
+            ("config", "GET", self._api_config_get, "读取插件配置"),
+            ("config", "POST", self._api_config_save, "保存插件配置"),
+        ]
+        for route, method, handler, desc in routes:
+            try:
+                register(f"/{PLUGIN_NAME}/{route}", handler, [method], desc)
+            except Exception as e:
+                logger.error(f"[页面] 注册 API {route} 失败: {e}")
+
+    def _target_files(self, chat: str, tid: str) -> list:
+        prefix = "napcat_private_" if chat == "private" else "napcat_"
+        return sorted(self.export_dir.glob(f"{prefix}{tid}_*.jsonl"))
+
+    def _count_rows_cached(self, files) -> int:
+        """统计 JSONL 行数（按 mtime/size 缓存，避免每次全量重算）。"""
+        cache = getattr(self, "_row_cache", None)
+        if cache is None:
+            cache = {}
+            self._row_cache = cache
+        total = 0
+        for fp in files:
+            try:
+                st = fp.stat()
+                key = str(fp)
+                hit = cache.get(key)
+                if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+                    total += hit[2]
+                    continue
+                rows = 0
+                with open(fp, encoding="utf-8", errors="replace") as f:
+                    for _line in f:
+                        rows += 1
+                cache[key] = (st.st_mtime_ns, st.st_size, rows)
+                total += rows
+            except Exception:
+                continue
+        return total
+
+    def _overview_data(self) -> dict:
+        targets = self._scan_archived_targets()
+        files = sorted(self.export_dir.glob("napcat_*.jsonl"))
+        days = set()
+        total_size = 0
+        for fp in files:
+            try:
+                total_size += fp.stat().st_size
+            except Exception:
+                pass
+            stem = fp.name[:-6]
+            parts = stem.split("_")
+            if len(parts) >= 3 and len(parts[-1]) == 10:
+                days.add(parts[-1])
+        items = []
+        for chat, tid in targets:
+            tfiles = self._target_files(chat, tid)
+            size = 0
+            for fp in tfiles:
+                try:
+                    size += fp.stat().st_size
+                except Exception:
+                    pass
+            ent = self._alias_entry(chat, tid) or {}
+            items.append({
+                "chat": chat,
+                "target": tid,
+                "label": self._target_label(chat, tid),
+                "name": str(ent.get("name") or ""),
+                "aliases": self._aliases_of(chat, tid),
+                "days": len(tfiles),
+                "rows": self._count_rows_cached(tfiles),
+                "size": size,
+                "last_date": (tfiles[-1].name.split("_")[-1][:-6] if tfiles else ""),
+            })
+        items.sort(key=lambda x: (-x["rows"], x["target"]))
+        return {
+            "version": PLUGIN_VERSION,
+            "export_dir": str(self.export_dir),
+            "backend": self.config.get("backend", "auto"),
+            "summary": {
+                "targets": len(targets),
+                "groups": sum(1 for c, _t in targets if c == "group"),
+                "privates": sum(1 for c, _t in targets if c == "private"),
+                "days": len(days),
+                "files": len(files),
+                "rows": self._count_rows_cached(files),
+                "size": total_size,
+                "last_date": (max(days) if days else ""),
+            },
+            "targets": items,
+        }
+
+    async def _api_state(self):
+        try:
+            return json_response(self._overview_data())
+        except Exception as e:
+            logger.error(f"[页面] 总览数据失败: {e}")
+            return error_response(f"总览数据失败: {e}", status_code=500)
+
+    async def _api_targets(self):
+        try:
+            return json_response({"targets": self._overview_data()["targets"]})
+        except Exception as e:
+            return error_response(f"目标列表失败: {e}", status_code=500)
+
+    async def _api_messages(self):
+        q = request.query
+        raw = (q.get("target") or "").strip()
+        date = (q.get("date") or "").strip()
+        try:
+            limit = int(q.get("limit") or 200)
+        except Exception:
+            limit = 200
+        limit = max(1, min(limit, 1000))
+        try:
+            offset = int(q.get("offset") or 0)
+        except Exception:
+            offset = 0
+        if not raw:
+            return error_response("缺少 target 参数", status_code=400)
+        r = self._resolve_target(raw)
+        if r is None:
+            return error_response(f"未找到目标「{raw}」", status_code=404)
+        if isinstance(r, tuple) and len(r) == 2 and r[0] == "AMBIGUOUS":
+            return error_response(self._alias_hint(raw), status_code=400)
+        chat, tid = r
+        files = self._target_files(chat, tid)
+        dates = [fp.name.split("_")[-1][:-6] for fp in files]
+        info = {"chat": chat, "target": tid, "label": self._target_label(chat, tid)}
+        if not files:
+            return json_response({"target": info, "dates": [], "messages": [], "total": 0})
+        if date and date in dates:
+            fp = files[dates.index(date)]
+        else:
+            fp = files[-1]
+            date = dates[-1]
+        records = []
+        try:
+            with open(fp, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except Exception:
+                        continue
+        except Exception as e:
+            return error_response(f"读取失败: {e}", status_code=500)
+        total = len(records)
+        end = max(0, total - offset)
+        start = max(0, end - limit)
+        return json_response({
+            "target": info,
+            "dates": dates,
+            "date": date,
+            "total": total,
+            "offset": offset,
+            "messages": records[start:end],
+        })
+
+    async def _api_config_get(self):
+        cfg = {}
+        for key, _kind in self._PAGE_CONFIG_FIELDS:
+            try:
+                cfg[key] = self.config.get(key)
+            except Exception:
+                cfg[key] = None
+        return json_response({
+            "config": cfg,
+            "meta": [{"key": k, "type": t} for k, t in self._PAGE_CONFIG_FIELDS],
+        })
+
+    async def _api_config_save(self):
+        payload = await request.json(default={})
+        patch = payload.get("patch") if isinstance(payload, dict) else None
+        if not isinstance(patch, dict) or not patch:
+            return error_response("patch 无效", status_code=400)
+        kinds = dict(self._PAGE_CONFIG_FIELDS)
+        cleaned = {}
+        for key, val in patch.items():
+            kind = kinds.get(key)
+            if kind is None:
+                continue
+            if kind == "bool":
+                cleaned[key] = (val if isinstance(val, bool)
+                                else str(val).lower() in ("1", "true", "yes", "on"))
+            elif kind == "int":
+                try:
+                    cleaned[key] = int(val)
+                except Exception:
+                    return error_response(f"{key} 需要整数", status_code=400)
+            elif kind == "list":
+                if isinstance(val, str):
+                    items = [x.strip() for x in val.replace("，", ",").replace(",", "\n").split("\n")]
+                    cleaned[key] = [x for x in items if x]
+                elif isinstance(val, list):
+                    cleaned[key] = [str(x).strip() for x in val if str(x).strip()]
+                else:
+                    return error_response(f"{key} 需要列表", status_code=400)
+            else:
+                cleaned[key] = "" if val is None else str(val)
+        if not cleaned:
+            return error_response("没有可保存的配置项", status_code=400)
+        try:
+            self.config.update(cleaned)
+        except Exception:
+            for k, v in cleaned.items():
+                self.config[k] = v
+        try:
+            saver = getattr(self.config, "save_config_async", None)
+            if callable(saver):
+                await saver()
+            else:
+                self.config.save_config()
+        except Exception as e:
+            logger.error(f"[页面] 保存配置失败: {e}")
+            return error_response(f"保存失败: {e}", status_code=500)
+        try:
+            self._alias_cfg = [str(x).strip() for x in (self.config.get("aliases") or []) if str(x).strip()]
+            self._sync_alias_config()
+        except Exception as e:
+            logger.error(f"[页面] 同步别名配置失败: {e}")
+        return json_response({"ok": True, "saved": sorted(cleaned.keys())})

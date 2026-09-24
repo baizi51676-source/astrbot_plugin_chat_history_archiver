@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>历史消息归档控制台</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="side">
+      <div class="brand"><span class="dot"></span>归档控制台</div>
+      <nav>
+        <button class="nav-btn active" data-view="overview">总览</button>
+        <button class="nav-btn" data-view="messages">消息查看</button>
+        <button class="nav-btn" data-view="config">配置</button>
+      </nav>
+      <div class="side-foot" id="foot-ver">—</div>
+    </aside>
+    <main class="main">
+      <section id="view-overview" class="view">
+        <div class="view-head">
+          <h2>总览</h2>
+          <button class="ghost" id="btn-refresh">刷新</button>
+        </div>
+        <div class="cards" id="cards"><div class="card loading">加载中…</div></div>
+        <h3 class="sub">归档目标</h3>
+        <div class="table-wrap">
+          <table class="tbl">
+            <thead>
+              <tr><th>名称</th><th>别名</th><th>群号 / QQ</th><th>类型</th><th>天数</th><th>条数</th><th>大小</th><th>最近</th></tr>
+            </thead>
+            <tbody id="targets-body"><tr><td colspan="8" class="muted">加载中…</td></tr></tbody>
+          </table>
+        </div>
+        <p class="muted" id="export-dir"></p>
+      </section>
+
+      <section id="view-messages" class="view hidden">
+        <div class="view-head">
+          <h2>消息查看</h2>
+          <div class="tools">
+            <select id="msg-target"></select>
+            <select id="msg-date"></select>
+            <button class="ghost" id="btn-load-msg">加载</button>
+          </div>
+        </div>
+        <div class="msg-meta muted" id="msg-meta"></div>
+        <div class="chat" id="chat"><div class="muted pad">选择目标与日期后点击「加载」</div></div>
+        <div class="pager"><button class="ghost" id="btn-more">加载更早</button></div>
+      </section>
+
+      <section id="view-config" class="view hidden">
+        <div class="view-head">
+          <h2>配置</h2>
+          <div class="tools">
+            <button class="ghost" id="btn-reload-cfg">重载</button>
+            <button class="primary" id="btn-save-cfg">保存</button>
+          </div>
+        </div>
+        <div class="form" id="config-form"><div class="muted pad">加载中…</div></div>
+        <p class="muted">提示：自动归档开关、循环间隔等配置在插件重载或 AstrBot 重启后完全生效。</p>
+      </section>
+    </main>
+  </div>
+  <div id="toast" class="toast hidden"></div>
+  <script src="./app.js"></script>
+</body>
+</html>
