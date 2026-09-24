@@ -69,6 +69,10 @@ const state = {
   pageSize: 50,
   names: {},
   namesKey: '',
+  hasMore: false,
+  loadingMore: false,
+  summaries: {},
+  summariesKey: '',
 };
 const AVATARS = {};
 
@@ -128,7 +132,7 @@ function switchView(v) {
   if (BAR_VIEWS.indexOf(v) >= 0) {
     ensureTargets(false).then(() => {
       if (v === 'messages') loadDates().then(() => loadMessages(true));
-      if (v === 'stats') { loadDates(); loadStats(); }
+      if (v === 'stats') { loadDates(); loadStats(); loadSummary(); }
     }).catch((e) => toast('目标加载失败：' + errText(e), true));
   }
 }
@@ -234,11 +238,13 @@ async function loadMessages(reset) {
     state.date = data.date || '';
     const items = data.items || [];
     state.total = data.total || 0;
+    state.hasMore = !!data.has_more;
     state.chat = reset ? items : items.concat(state.chat);
     renderChat();
     const label = (data.target && data.target.label) || state.target.target;
     $('msg-meta').textContent = label + ' · ' + state.date + ' · 当日共 ' + state.total + ' 条'
       + (state.offset ? '（已向前加载 ' + state.offset + ' 条）' : '');
+    updateMsgHint();
   } catch (e) {
     toast('消息加载失败：' + errText(e), true);
   }
@@ -415,15 +421,23 @@ async function boot() {
   document.querySelectorAll('.nav-btn').forEach((b) =>
     b.addEventListener('click', () => switchView(b.dataset.view)));
   $('btn-refresh').addEventListener('click', loadOverview);
-  $('btn-more').addEventListener('click', () => { state.offset += state.pageSize; loadMessages(false); });
+  const chatBox = $('chat');
+  if (chatBox) {
+    chatBox.addEventListener('scroll', () => {
+      if (chatBox.scrollTop <= 24) loadOlder();
+    });
+  }
   $('sel-target').addEventListener('change', () => {
     syncTargetFromSelect();
     state.chat = [];
     state.offset = 0;
     loadDates();
-    if (state.view === 'stats') loadStats(); else loadMessages(true);
+    if (state.view === 'stats') { loadStats(); loadSummary(); } else loadMessages(true);
   });
-  $('sel-date').addEventListener('change', () => { state.offset = 0; loadMessages(true); });
+  $('sel-date').addEventListener('change', () => {
+    state.offset = 0;
+    if (state.view === 'stats') { renderSummary(); } else { loadMessages(true); }
+  });
   $('sel-days').addEventListener('change', () => { state.days = Number($('sel-days').value) || 30; loadStats(); });
   $('btn-reload').addEventListener('click', () => {
     if (state.view === 'messages') { loadDates().then(() => loadMessages(true)); }
@@ -446,6 +460,12 @@ async function boot() {
     if (chip) { onReplyClick(chip.dataset.reply); return; }
     const go = e.target.closest && e.target.closest('[data-goto-date]');
     if (go) { gotoHit(go.dataset.gotoDate, go.dataset.gotoSeq); }
+    const hist = e.target.closest && e.target.closest('[data-hit-date]');
+    if (hist) {
+      const d = hist.dataset.hitDate;
+      $('summary-text').innerHTML = '<div class="summary-title">' + esc(d) + '（历史）</div>'
+        + '<div class="summary-body">' + esc(state.summaries[d] || '') + '</div>';
+    }
   });
 
   try {
@@ -628,6 +648,10 @@ async function genSummary(force) {
     box.innerHTML = '<div class="summary-title">' + esc((res && res.date) || '')
       + ((res && res.cached) ? '（已缓存）' : '（新生成）') + '</div>'
       + '<div class="summary-body">' + esc((res && res.summary) || '') + '</div>';
+    if (res && res.date && res.summary) {
+      state.summaries[res.date] = res.summary;
+      renderSummary();
+    }
   } catch (e) {
     box.innerHTML = '<span class="muted">总结失败：' + esc(errText(e)) + '</span>';
   }
@@ -662,4 +686,97 @@ async function triggerArchive() {
   } catch (e) {
     toast('触发失败：' + errText(e), true);
   }
+}
+
+/* ---------- v2.3.0：滚动加载 + 按目标总结 / 总结历史 ---------- */
+
+function updateMsgHint() {
+  const el = $('msg-hint');
+  if (!el) return;
+  if (state.loadingMore) {
+    el.textContent = '正在加载更早消息…';
+    return;
+  }
+  if (!state.chat.length) {
+    el.textContent = '';
+    return;
+  }
+  el.textContent = state.hasMore ? '向上滑动自动加载更早消息' : '已经到最早一条了';
+}
+
+async function loadOlder() {
+  if (state.loadingMore || !state.hasMore || state.view !== 'messages') return;
+  const box = $('chat');
+  if (!box) return;
+  state.loadingMore = true;
+  updateMsgHint();
+  const prevHeight = box.scrollHeight;
+  const prevTop = box.scrollTop;
+  state.offset += state.pageSize;
+  try {
+    await loadMessages(false);
+  } finally {
+    state.loadingMore = false;
+    updateMsgHint();
+  }
+  /* 保持视口位置：向上加载后内容变长，不跳走 */
+  box.scrollTop = box.scrollHeight - prevHeight + prevTop;
+}
+
+async function loadSummary(force) {
+  syncTargetFromSelect();
+  if (!state.target) return;
+  const key = targetKey(state.target);
+  if (!force && state.summariesKey === key) {
+    renderSummary();
+    return;
+  }
+  const hist = $('summary-history');
+  if (hist) hist.innerHTML = '<div class="muted pad">加载中…</div>';
+  try {
+    const data = await apiGet('summary_get', {
+      chat: state.target.chat,
+      target_id: state.target.target,
+    });
+    const items = (data && data.items) || [];
+    const map = {};
+    items.forEach((it) => { if (it && it.date) map[it.date] = it.summary || ''; });
+    state.summaries = map;
+    state.summariesKey = key;
+  } catch (e) {
+    state.summaries = {};
+    state.summariesKey = key;
+    if (hist) hist.innerHTML = '<div class="muted pad">总结历史加载失败：' + esc(errText(e)) + '</div>';
+  }
+  renderSummary();
+}
+
+function renderSummary() {
+  const box = $('summary-text');
+  const date = state.date || ($('sel-date') && $('sel-date').value) || '';
+  const cur = (state.summaries || {})[date];
+  const t = state.target;
+  const label = t ? ((t.chat === 'private' ? '私聊 ' : '群聊 ') + t.target) : '';
+  if (box) {
+    if (cur) {
+      box.innerHTML = '<div class="summary-title">' + esc(label + ' · ' + date + '（已生成）') + '</div>'
+        + '<div class="summary-body">' + esc(cur) + '</div>';
+    } else {
+      box.innerHTML = '<span class="muted">' + esc(label)
+        + (date ? (' · ' + esc(date)) : '') + ' 还没有总结，可点上方「总结所选日期」生成。'
+        + '</span>';
+    }
+  }
+  const hist = $('summary-history');
+  if (!hist) return;
+  const dates = Object.keys(state.summaries || {}).sort().reverse();
+  if (!dates.length) {
+    hist.innerHTML = '<div class="muted pad">该目标暂无历史总结</div>';
+    return;
+  }
+  hist.innerHTML = dates.map((d) =>
+    '<div class="hist-item" data-hit-date="' + esc(d) + '">'
+    + '<span class="hist-date">' + esc(d) + '</span>'
+    + '<span class="hist-preview">' + esc(String(state.summaries[d] || '').slice(0, 80)) + '</span>'
+    + '</div>').join('');
 }

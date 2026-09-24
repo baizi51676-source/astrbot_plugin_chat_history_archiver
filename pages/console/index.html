@@ -60,7 +60,7 @@
         <div class="view-head"><h2>消息预览</h2><div class="tools"><button class="ghost" id="btn-names">刷新昵称</button></div></div>
         <div class="msg-meta muted" id="msg-meta"></div>
         <div class="chat" id="chat"><div class="muted pad">选择目标后点击「加载」</div></div>
-        <div class="pager"><button class="ghost" id="btn-more">加载更早</button></div>
+        <div class="pager msg-hint muted" id="msg-hint">向上滑动自动加载更早消息</div>
       </section>
 
       <section id="view-stats" class="view hidden">
@@ -81,6 +81,8 @@
             <button class="ghost" id="btn-brief">生成/查看简报</button>
           </div>
           <div class="summary-box" id="summary-text"><span class="muted">尚未生成总结（总结默认关闭，手动触发不产生后台费用）</span></div>
+          <div class="sub2">该目标总结历史</div>
+          <div class="panel" id="summary-history"><div class="muted pad">加载中…</div></div>
         </div>
       </section>
 
