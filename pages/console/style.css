@@ -243,6 +243,8 @@ select:focus, input:focus, textarea:focus { outline: none; border-color: var(--a
 .toast.hidden { display: none; }
 /* 顶部工具栏 */
 .topbar {
+  position: relative;
+  z-index: 50;
   display: flex;
   gap: 8px;
   align-items: center;
@@ -385,7 +387,7 @@ button.mini { padding: 3px 8px; font-size: 12px; }
   position: absolute;
   top: calc(100% + 8px);
   left: 0;
-  z-index: 60;
+  z-index: 70;
   display: flex;
   background: var(--panel-solid);
   border: 1px solid var(--line);

@@ -130,7 +130,7 @@ function switchView(v) {
     if (el) el.classList.toggle('hidden', name !== v);
   });
   $('topbar').classList.toggle('hidden', BAR_VIEWS.indexOf(v) < 0);
-  $('range-wrap').classList.toggle('hidden', v !== 'stats');
+  $('range-wrap').classList.toggle('hidden', BAR_VIEWS.indexOf(v) < 0);
 
   if (v === 'overview') loadOverview();
   if (v === 'config') loadConfig();
