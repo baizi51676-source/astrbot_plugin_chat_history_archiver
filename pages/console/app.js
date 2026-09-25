@@ -65,6 +65,9 @@ const state = {
   dates: [],
   date: '',
   days: 30,
+  range: { start: '', end: '', label: '' },
+  picking: '',
+  cal: { left: { y: 0, m: 0 } },
   config: {},
   chat: [],
   offset: 0,
@@ -127,14 +130,14 @@ function switchView(v) {
     if (el) el.classList.toggle('hidden', name !== v);
   });
   $('topbar').classList.toggle('hidden', BAR_VIEWS.indexOf(v) < 0);
-  $('sel-days').classList.toggle('hidden', v !== 'stats');
+  $('range-wrap').classList.toggle('hidden', v !== 'stats');
 
   if (v === 'overview') loadOverview();
   if (v === 'config') loadConfig();
   if (BAR_VIEWS.indexOf(v) >= 0) {
     ensureTargets(false).then(() => {
       if (v === 'messages') loadDates().then(() => loadMessages(true));
-      if (v === 'stats') { loadDates(); loadStats(); loadSummary(); }
+      if (v === 'stats') { loadDates().then(() => { loadStats(); loadSummary(); }); }
     }).catch((e) => toast('目标加载失败：' + errText(e), true));
   }
 }
@@ -175,7 +178,7 @@ async function loadBrief() {
   const box = $('brief-text');
   if (!box) return;
   try {
-    const res = await apiGet('briefing', { days: state.days, get: 1 });
+    const res = await apiGet('briefing', { days: rangeDays(), get: 1 });
     if (res && res.brief) {
       box.innerHTML = '<div class="summary-title">简报 ' + esc(res.date || '')
         + '（已缓存）</div><div class="summary-body">' + esc(res.brief) + '</div>';
@@ -302,15 +305,222 @@ function ensureAvatars() {
   });
 }
 
+/* ---------- v2.3.2：DeepSeek 风格日期范围选择器 ---------- */
+
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+function dstr(d) {
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+}
+
+function parseD(s) {
+  const p = String(s || '').split('-');
+  return p.length === 3 ? new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2])) : null;
+}
+
+function todayD() {
+  const d = new Date();
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+const DAY_MS = 86400000;
+
+function rangeDays() {
+  const s = parseD(state.range.start);
+  const e = parseD(state.range.end);
+  if (s && e) return Math.max(1, Math.round((e - s) / DAY_MS) + 1);
+  if (state.range.label === '当天' || state.range.label === '今天'
+      || state.range.label === '昨天') return 1;
+  return state.days || 30;
+}
+
+const PRESETS = [
+  ['当天', 'cur'], ['今天', 'today'], ['昨天', 'yes'],
+  ['近 7 天', 'd7'], ['近 30 天', 'd30'],
+  ['本月', 'tm'], ['上月', 'lm'], ['自定义', 'custom'],
+];
+
+function presetRange(key) {
+  const t = todayD();
+  if (key === 'today') return [dstr(t), dstr(t), '今天'];
+  if (key === 'yes') {
+    const y = new Date(t.getTime() - DAY_MS);
+    return [dstr(y), dstr(y), '昨天'];
+  }
+  if (key === 'd7') return [dstr(new Date(t.getTime() - 6 * DAY_MS)), dstr(t), '近 7 天'];
+  if (key === 'd30') return [dstr(new Date(t.getTime() - 29 * DAY_MS)), dstr(t), '近 30 天'];
+  if (key === 'tm') return [dstr(new Date(t.getFullYear(), t.getMonth(), 1)), dstr(t), '本月'];
+  if (key === 'lm') {
+    return [dstr(new Date(t.getFullYear(), t.getMonth() - 1, 1)),
+      dstr(new Date(t.getFullYear(), t.getMonth(), 0)), '上月'];
+  }
+  if (key === 'cur') {
+    const d = ($('sel-date') && $('sel-date').value) || state.date || dstr(t);
+    return [d, d, '当天'];
+  }
+  return null;
+}
+
+function renderPresets() {
+  const box = $('rp-presets');
+  if (!box) return;
+  box.innerHTML = PRESETS.map((p) =>
+    '<button class="rp-item' + (state.range.label === p[0] ? ' on' : '')
+    + '" data-preset="' + p[1] + '">' + esc(p[0]) + '</button>').join('');
+}
+
+function calShift(n) {
+  const c = state.cal.left || { y: todayD().getFullYear(), m: todayD().getMonth() };
+  let m = c.m + n;
+  let y = c.y;
+  while (m < 0) { m += 12; y -= 1; }
+  while (m > 11) { m -= 12; y += 1; }
+  state.cal.left = { y: y, m: m };
+  renderCalendar();
+}
+
+function monthGrid(y, m) {
+  const dim = new Date(y, m + 1, 0).getDate();
+  const startWd = new Date(y, m, 1).getDay();
+  const today = dstr(todayD());
+  const s = state.range.start;
+  const e = state.range.end;
+  const wk = ['日', '一', '二', '三', '四', '五', '六'];
+  let html = '<div class="rp-month"><div class="rp-mtitle">' + y + ' 年 ' + (m + 1)
+    + ' 月</div><div class="rp-wk">'
+    + wk.map((w) => '<span>' + w + '</span>').join('') + '</div><div class="rp-days">';
+  for (let i = 0; i < startWd; i += 1) html += '<span class="rp-day empty"></span>';
+  for (let d = 1; d <= dim; d += 1) {
+    const ds = y + '-' + pad2(m + 1) + '-' + pad2(d);
+    const cls = ['rp-day'];
+    if (ds === today) cls.push('today');
+    if (s && ds === s) cls.push('edge');
+    if (e && ds === e) cls.push('edge');
+    if (s && e && ds > s && ds < e) cls.push('mid');
+    if (s && !e && ds === s) cls.push('sel');
+    if (ds > today) cls.push('future');
+    html += '<span class="' + cls.join(' ') + '" data-day="' + ds + '">' + d + '</span>';
+  }
+  return html + '</div></div>';
+}
+
+function renderCalendar() {
+  const box = $('rp-grids');
+  if (!box) return;
+  const t = todayD();
+  const c = state.cal.left || { y: t.getFullYear(), m: t.getMonth() };
+  let m2 = c.m + 1;
+  let y2 = c.y;
+  if (m2 > 11) { m2 = 0; y2 += 1; }
+  box.innerHTML = monthGrid(c.y, c.m) + monthGrid(y2, m2);
+  const hint = $('rp-hint');
+  if (hint) {
+    if (state.range.start && !state.range.end) {
+      hint.textContent = '开始 ' + state.range.start + '，请选择结束日期';
+    } else if (state.picking === 'start') {
+      hint.textContent = '请选择开始日期';
+    } else {
+      hint.textContent = '选择开始 / 结束日期';
+    }
+  }
+}
+
+function openRangePop() {
+  const pop = $('range-pop');
+  if (!pop) return;
+  const d = parseD(state.range.end) || parseD(state.range.start) || todayD();
+  state.cal.left = { y: d.getFullYear(), m: d.getMonth() };
+  state.picking = '';
+  renderPresets();
+  renderCalendar();
+  pop.classList.remove('hidden');
+}
+
+function closeRangePop() {
+  const pop = $('range-pop');
+  if (pop) pop.classList.add('hidden');
+}
+
+function applyRange(start, end, label, silent) {
+  const s = start || '';
+  const e = end || '';
+  state.range = { start: s, end: e, label: label || (s + ' ~ ' + e) };
+  state.picking = '';
+  state.days = rangeDays();
+  const lb = $('range-label');
+  if (lb) lb.textContent = state.range.label;
+  const sel = $('sel-date');
+  if (s && e && s === e && sel && state.dates.some((x) => x.date === s)) {
+    sel.value = s;
+    state.date = s;
+  }
+  renderPresets();
+  closeRangePop();
+  if (!silent) { loadStats(); renderSummary(); }
+}
+
+function initRangePicker() {
+  const btn = $('btn-range');
+  const pop = $('range-pop');
+  if (!btn || !pop) return;
+  btn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    if (pop.classList.contains('hidden')) openRangePop(); else closeRangePop();
+  });
+  const prev = $('rp-prev');
+  const next = $('rp-next');
+  if (prev) prev.addEventListener('click', (ev) => { ev.stopPropagation(); calShift(-1); });
+  if (next) next.addEventListener('click', (ev) => { ev.stopPropagation(); calShift(1); });
+  pop.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    const p = ev.target.closest && ev.target.closest('[data-preset]');
+    if (p) {
+      const key = p.dataset.preset;
+      if (key === 'custom') {
+        state.range = { start: '', end: '', label: '自定义' };
+        state.picking = 'start';
+        const lb = $('range-label');
+        if (lb) lb.textContent = '自定义';
+        renderPresets();
+        renderCalendar();
+        return;
+      }
+      const pr = presetRange(key);
+      if (pr) applyRange(pr[0], pr[1], pr[2]);
+      return;
+    }
+    const day = ev.target.closest && ev.target.closest('[data-day]');
+    if (!day || day.classList.contains('future') || day.classList.contains('empty')) return;
+    const ds = day.dataset.day;
+    if (!state.picking || state.picking === 'start') {
+      state.picking = 'end';
+      state.range = { start: ds, end: '', label: '自定义' };
+      renderCalendar();
+      return;
+    }
+    let s = state.range.start || ds;
+    let e = ds;
+    if (e < s) { const t = s; s = e; e = t; }
+    applyRange(s, e, '自定义');
+  });
+  document.addEventListener('click', () => closeRangePop());
+}
+
 async function loadStats() {
   syncTargetFromSelect();
   if (!state.target) return;
   try {
-    const data = await apiGet('stats', {
+    const params = {
       chat: state.target.chat,
       target_id: state.target.target,
-      days: state.days,
-    });
+    };
+    if (state.range.start || state.range.end) {
+      params.start = state.range.start || '';
+      params.end = state.range.end || '';
+    } else {
+      params.days = rangeDays();
+    }
+    const data = await apiGet('stats', params);
     renderStats(data);
   } catch (e) {
     toast('统计加载失败：' + errText(e), true);
@@ -448,17 +658,19 @@ async function boot() {
     syncTargetFromSelect();
     state.chat = [];
     state.offset = 0;
-    loadDates();
-    if (state.view === 'stats') { loadStats(); loadSummary(); } else loadMessages(true);
+    loadDates().then(() => {
+      if (state.view === 'stats') { loadStats(); loadSummary(); } else loadMessages(true);
+    });
   });
   $('sel-date').addEventListener('change', () => {
+    state.date = $('sel-date').value || '';
     state.offset = 0;
     if (state.view === 'stats') { renderSummary(); } else { loadMessages(true); }
   });
-  $('sel-days').addEventListener('change', () => { state.days = Number($('sel-days').value) || 30; loadStats(); });
+  initRangePicker();
   $('btn-reload').addEventListener('click', () => {
     if (state.view === 'messages') { loadDates().then(() => loadMessages(true)); }
-    else if (state.view === 'stats') { loadDates(); loadStats(); }
+    else if (state.view === 'stats') { loadDates().then(() => { loadStats(); loadSummary(); }); }
   });
   $('btn-reload-cfg').addEventListener('click', loadConfig);
   $('btn-save-cfg').addEventListener('click', saveConfig);
@@ -491,6 +703,8 @@ async function boot() {
     state.pageSize = Math.max(10, Math.min(500, Number(state.config.ui_messages_page_size) || 50));
   } catch (e) { /* 忽略，用默认值 */ }
 
+  const pr = presetRange('d30');
+  if (pr) applyRange(pr[0], pr[1], pr[2], true);
   const tab = state.config.ui_default_tab || 'overview';
   switchView(VIEWS.indexOf(tab) >= 0 ? tab : 'overview');
 }
@@ -643,6 +857,7 @@ async function gotoHit(date, seq) {
     await loadDates();
   }
   if (sel) sel.value = date;
+  if (date) state.date = date;
   state.offset = 0;
   await loadMessages(true);
   switchView('messages');
@@ -658,7 +873,7 @@ async function genSummary(force) {
     const res = await apiPost('summary', {
       chat: state.target.chat,
       target_id: state.target.target,
-      date: state.date || ($('sel-date') && $('sel-date').value) || '',
+      date: ($('sel-date') && $('sel-date').value) || state.date || '',
       trend: !!($('sum-trend') && $('sum-trend').checked),
       force: !!force,
     });
@@ -680,12 +895,12 @@ async function showBriefing() {
   try {
     let res = null;
     try {
-      res = await apiGet('briefing', { days: state.days, get: 1 });
+      res = await apiGet('briefing', { days: rangeDays(), get: 1 });
     } catch (e) {
       res = null;
     }
     if (!res || !res.brief) {
-      res = await apiGet('briefing', { days: state.days });
+      res = await apiGet('briefing', { days: rangeDays() });
     }
     box.innerHTML = '<div class="summary-title">简报 ' + esc((res && res.date) || '')
       + ((res && res.cached) ? '（已缓存）' : '') + '</div>'
@@ -770,7 +985,8 @@ async function loadSummary(force) {
 
 function renderSummary() {
   const box = $('summary-text');
-  const date = state.date || ($('sel-date') && $('sel-date').value) || '';
+  const date = ($('sel-date') && $('sel-date').value) || state.date || '';
+  if (date) state.date = date;
   const cur = (state.summaries || {})[date];
   const t = state.target;
   const label = t ? ((t.chat === 'private' ? '私聊 ' : '群聊 ') + t.target) : '';

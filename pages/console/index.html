@@ -27,13 +27,20 @@
       <div class="topbar hidden" id="topbar">
         <select id="sel-target"></select>
         <select id="sel-date"></select>
-        <select id="sel-days" class="hidden">
-          <option value="1">当天</option>
-          <option value="7">最近 7 天</option>
-          <option value="30" selected>最近 30 天</option>
-          <option value="90">最近 90 天</option>
-          <option value="365">最近 1 年</option>
-        </select>
+        <div class="range-wrap hidden" id="range-wrap">
+          <button class="ghost" id="btn-range"><span id="range-label">近 30 天</span><span class="caret">▾</span></button>
+          <div class="range-pop hidden" id="range-pop">
+            <div class="rp-presets" id="rp-presets"></div>
+            <div class="rp-cal">
+              <div class="rp-head">
+                <button class="mini" id="rp-prev">‹</button>
+                <span class="rp-hint" id="rp-hint">选择开始 / 结束日期</span>
+                <button class="mini" id="rp-next">›</button>
+              </div>
+              <div class="rp-grids" id="rp-grids"></div>
+            </div>
+          </div>
+        </div>
         <button class="ghost" id="btn-reload">加载</button>
         <span class="muted" id="bar-hint"></span>
       </div>

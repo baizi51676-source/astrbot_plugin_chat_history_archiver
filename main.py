@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover - 旧版 AstrBot 无插件页面 API
     _WEB_AVAILABLE = False
 
 PLUGIN_NAME = "astrbot_plugin_chat_history_archiver"
-PLUGIN_VERSION = "2.3.1"
+PLUGIN_VERSION = "2.3.2"
 
 # 消息段类型 → 占位符（不导出媒体文件）
 _SEG_PLACEHOLDER = {
@@ -2224,13 +2224,26 @@ class NapcatHistoryExporter(Star):
         if err:
             return error_response(err, status_code=400)
         chat, tid = r
-        try:
-            days = int(q.get("days") or 30)
-        except Exception:
-            days = 30
-        days = max(1, min(days, 365))
+        start = (q.get("start") or "").strip()
+        end = (q.get("end") or "").strip()
         files = self._target_files(chat, tid)
-        recent = files[-days:] if len(files) > days else files
+        if start or end:
+            if start and not self._safe_date(start):
+                return error_response("start 非法（应为 YYYY-MM-DD）", status_code=400)
+            if end and not self._safe_date(end):
+                return error_response("end 非法（应为 YYYY-MM-DD）", status_code=400)
+            if start and end and start > end:
+                start, end = end, start
+            recent = [fp for fp in files
+                      if (not start or fp.name.split("_")[-1][:-6] >= start)
+                      and (not end or fp.name.split("_")[-1][:-6] <= end)]
+        else:
+            try:
+                days = int(q.get("days") or 30)
+            except Exception:
+                days = 30
+            days = max(1, min(days, 365))
+            recent = files[-days:] if len(files) > days else files
         daily = []
         by_sender = {}
         hourly = [0] * 24
@@ -2272,6 +2285,8 @@ class NapcatHistoryExporter(Star):
         return json_response({
             "target": {"chat": chat, "target": tid, "label": self._target_label(chat, tid)},
             "days": len(recent),
+            "start": (recent[0].name.split("_")[-1][:-6] if recent else start),
+            "end": (recent[-1].name.split("_")[-1][:-6] if recent else end),
             "total": total,
             "daily": daily,
             "top_senders": top,

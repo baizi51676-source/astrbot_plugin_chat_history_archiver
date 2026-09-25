@@ -373,3 +373,55 @@ button.mini { padding: 3px 8px; font-size: 12px; }
 .hist-item:hover .hist-date { color: var(--accent); }
 .hist-date { flex: 0 0 100px; color: var(--muted); font-size: 12px; }
 .hist-preview { flex: 1; min-width: 0; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* DeepSeek 风格日期范围选择器 */
+.range-wrap { position: relative; }
+.range-wrap.hidden { display: none; }
+#btn-range { display: inline-flex; align-items: center; gap: 8px; justify-content: space-between; min-width: 112px; }
+.caret { color: var(--muted); font-size: 11px; }
+.range-pop {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 40;
+  display: flex;
+  background: var(--glass);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 10px;
+}
+.range-pop.hidden { display: none; }
+.rp-presets {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-right: 10px;
+  border-right: 1px solid var(--line);
+  min-width: 104px;
+}
+.rp-item { text-align: left; border: 0; background: transparent; color: var(--muted); padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.rp-item:hover { background: var(--glass-2); color: var(--text); }
+.rp-item.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.rp-cal { padding-left: 12px; }
+.rp-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+.rp-hint { color: var(--muted); font-size: 12px; }
+.rp-grids { display: flex; gap: 16px; }
+.rp-month { min-width: 196px; }
+.rp-mtitle { text-align: center; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+.rp-wk, .rp-days { display: grid; grid-template-columns: repeat(7, 1fr); }
+.rp-wk span { text-align: center; font-size: 11px; color: var(--muted); padding: 2px 0; }
+.rp-day { text-align: center; font-size: 12px; padding: 5px 0; border-radius: 6px; cursor: pointer; }
+.rp-day.empty { cursor: default; }
+.rp-day:hover:not(.empty):not(.future) { background: var(--glass-2); }
+.rp-day.mid { background: var(--accent-soft); border-radius: 0; }
+.rp-day.edge, .rp-day.sel { background: var(--accent); color: var(--on-accent); font-weight: 600; }
+.rp-day.today { box-shadow: inset 0 0 0 1px var(--accent); }
+.rp-day.future { color: var(--muted); opacity: .45; cursor: default; }
+@media (max-width: 720px) {
+  .range-pop { flex-direction: column; left: auto; right: 0; max-width: calc(100vw - 36px); }
+  .rp-presets { flex-direction: row; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 8px; }
+  .rp-cal { padding: 8px 0 0; }
+  .rp-grids { flex-direction: column; gap: 10px; }
+  .rp-month { min-width: 0; }
+}
