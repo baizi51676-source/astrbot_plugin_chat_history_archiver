@@ -2059,32 +2059,48 @@ class NapcatHistoryExporter(Star):
         info = {"chat": chat, "target": tid, "label": self._target_label(chat, tid)}
         if not files:
             return json_response({"target": info, "dates": [], "messages": [], "total": 0})
-        if date and date in dates:
-            fp = files[dates.index(date)]
-        else:
-            fp = files[-1]
-            date = dates[-1]
+        # v2.3.2：支持日期区间（start/end），无区间时沿用单个 date
+        rng_start = (q.get("start") or "").strip()
+        rng_end = (q.get("end") or "").strip()
+        if rng_start and not self._safe_date(rng_start):
+            return error_response("start 非法（应为 YYYY-MM-DD）", status_code=400)
+        if rng_end and not self._safe_date(rng_end):
+            return error_response("end 非法（应为 YYYY-MM-DD）", status_code=400)
+        if not (rng_start or rng_end):
+            rng_start = rng_end = date or dates[-1]
+        elif rng_start and rng_end and rng_start > rng_end:
+            rng_start, rng_end = rng_end, rng_start
+        sel_files = []
+        for fp in files:
+            d = fp.name.split("_")[-1][:-6]
+            if (not rng_start or d >= rng_start) and (not rng_end or d <= rng_end):
+                sel_files.append(fp)
         records = []
-        try:
-            with open(fp, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        records.append(json.loads(line))
-                    except Exception:
-                        continue
-        except Exception as e:
-            return error_response(f"读取失败: {e}", status_code=500)
+        for fp in sel_files:
+            d = fp.name.split("_")[-1][:-6]
+            try:
+                with open(fp, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+                        rec["_date"] = d
+                        records.append(rec)
+            except Exception as e:
+                return error_response(f"读取失败: {e}", status_code=500)
         total = len(records)
-        end = max(0, total - offset)
-        start = max(0, end - limit)
-        page = records[start:end]
+        end_i = max(0, total - offset)
+        start_i = max(0, end_i - limit)
+        page = records[start_i:end_i]
         items = []
         for rec in page:
             items.append({
                 "seq": rec.get("seq"),
+                "date": rec.get("_date") or "",
                 "time": rec.get("t", ""),
                 "sender_id": str(rec.get("user_id") or ""),
                 "sender_name": rec.get("nickname") or "",
@@ -2094,10 +2110,13 @@ class NapcatHistoryExporter(Star):
         return json_response({
             "target": info,
             "dates": dates,
-            "date": date,
+            "date": (rng_start if rng_start == rng_end else ""),
+            "start": rng_start,
+            "end": rng_end,
+            "selected_dates": [fp.name.split("_")[-1][:-6] for fp in sel_files],
             "total": total,
             "offset": offset,
-            "has_more": start > 0,
+            "has_more": start_i > 0,
             "messages": page,
             "items": items,
         })

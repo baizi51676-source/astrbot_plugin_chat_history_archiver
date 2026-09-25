@@ -226,12 +226,9 @@ async function loadDates() {
   try {
     const data = await apiGet('dates', { chat: state.target.chat, target_id: state.target.target });
     state.dates = (data && data.dates) || [];
-    const sel = $('sel-date');
-    const cur = sel.value;
-    sel.innerHTML = state.dates.map((d) =>
-      '<option value="' + esc(d.date) + '">' + esc(d.date) + '（' + d.count + ' 条）</option>').join('');
-    if (cur && state.dates.some((d) => d.date === cur)) sel.value = cur;
-    state.date = sel.value || '';
+    if (!state.range.start && !state.range.end && state.dates.length) {
+      state.date = state.dates[state.dates.length - 1].date;
+    }
   } catch (e) {
     toast('日期列表加载失败：' + errText(e), true);
   }
@@ -248,21 +245,27 @@ async function loadMessages(reset) {
     state.chat = [];
   }
   try {
-    const data = await apiGet('messages', {
+    const mparams = {
       chat: state.target.chat,
       target_id: state.target.target,
-      date: reset ? ($('sel-date').value || '') : (state.date || ''),
       limit: state.pageSize,
       offset: state.offset,
-    });
-    state.date = data.date || '';
+    };
+    if (state.range.start || state.range.end) {
+      mparams.start = state.range.start || '';
+      mparams.end = state.range.end || '';
+    }
+    const data = await apiGet('messages', mparams);
     const items = data.items || [];
     state.total = data.total || 0;
     state.hasMore = !!data.has_more;
     state.chat = reset ? items : items.concat(state.chat);
     renderChat();
     const label = (data.target && data.target.label) || state.target.target;
-    $('msg-meta').textContent = label + ' · ' + state.date + ' · 当日共 ' + state.total + ' 条'
+    const rng = (data.start && data.end && data.start !== data.end)
+      ? (data.start + ' ~ ' + data.end)
+      : (data.start || data.end || state.date || '全部');
+    $('msg-meta').textContent = label + ' · ' + rng + ' · 共 ' + state.total + ' 条'
       + (state.offset ? '（已向前加载 ' + state.offset + ' 条）' : '');
     updateMsgHint();
   } catch (e) {
@@ -270,15 +273,28 @@ async function loadMessages(reset) {
   }
 }
 
+function chatHtml() {
+  if (!state.chat.length) return '<div class="muted pad">该范围没有消息</div>';
+  let html = '';
+  let last = '';
+  state.chat.forEach((m) => {
+    const d = m.date || '';
+    if (d && d !== last) {
+      html += '<div class="day-sep">' + esc(d) + '</div>';
+      last = d;
+    }
+    html += bubble(m);
+  });
+  return html;
+}
+
 function renderChat() {
   const box = $('chat');
-  box.innerHTML = state.chat.length
-    ? state.chat.map(bubble).join('')
-    : '<div class="muted pad">该日没有消息</div>';
+  box.innerHTML = chatHtml();
   if (!state.offset) box.scrollTop = box.scrollHeight;
   ensureNames(false).then(() => { /* 名称到手后重绘一次 */
     if (state.namesKey) {
-      const again = state.chat.map(bubble).join("");
+      const again = chatHtml();
       if (again && again !== box.innerHTML) box.innerHTML = again;
     }
   });
@@ -335,13 +351,14 @@ function rangeDays() {
 }
 
 const PRESETS = [
-  ['当天', 'cur'], ['今天', 'today'], ['昨天', 'yes'],
+  ['全部时间', 'all'], ['当天', 'cur'], ['今天', 'today'], ['昨天', 'yes'],
   ['近 7 天', 'd7'], ['近 30 天', 'd30'],
   ['本月', 'tm'], ['上月', 'lm'], ['自定义', 'custom'],
 ];
 
 function presetRange(key) {
   const t = todayD();
+  if (key === 'all') return ['', '', '全部时间'];
   if (key === 'today') return [dstr(t), dstr(t), '今天'];
   if (key === 'yes') {
     const y = new Date(t.getTime() - DAY_MS);
@@ -355,7 +372,7 @@ function presetRange(key) {
       dstr(new Date(t.getFullYear(), t.getMonth(), 0)), '上月'];
   }
   if (key === 'cur') {
-    const d = ($('sel-date') && $('sel-date').value) || state.date || dstr(t);
+    const d = state.range.end || state.date || latestDate() || dstr(t);
     return [d, d, '当天'];
   }
   return null;
@@ -449,14 +466,14 @@ function applyRange(start, end, label, silent) {
   state.days = rangeDays();
   const lb = $('range-label');
   if (lb) lb.textContent = state.range.label;
-  const sel = $('sel-date');
-  if (s && e && s === e && sel && state.dates.some((x) => x.date === s)) {
-    sel.value = s;
-    state.date = s;
-  }
+  if (e || s) state.date = e || s;
   renderPresets();
   closeRangePop();
-  if (!silent) { loadStats(); renderSummary(); }
+  if (silent) return;
+  if (state.view === 'search') { runSearch(); return; }
+  if (state.view === 'messages') { loadMessages(true); return; }
+  loadStats();
+  renderSummary();
 }
 
 function initRangePicker() {
@@ -506,6 +523,15 @@ function initRangePicker() {
   document.addEventListener('click', () => closeRangePop());
 }
 
+function latestDate() {
+  const arr = state.dates || [];
+  return arr.length ? arr[arr.length - 1].date : '';
+}
+
+function curDate() {
+  return state.range.end || state.range.start || state.date || latestDate() || '';
+}
+
 async function loadStats() {
   syncTargetFromSelect();
   if (!state.target) return;
@@ -517,6 +543,8 @@ async function loadStats() {
     if (state.range.start || state.range.end) {
       params.start = state.range.start || '';
       params.end = state.range.end || '';
+    } else if (state.range.label === '全部时间') {
+      params.days = 365;
     } else {
       params.days = rangeDays();
     }
@@ -662,11 +690,6 @@ async function boot() {
       if (state.view === 'stats') { loadStats(); loadSummary(); } else loadMessages(true);
     });
   });
-  $('sel-date').addEventListener('change', () => {
-    state.date = $('sel-date').value || '';
-    state.offset = 0;
-    if (state.view === 'stats') { renderSummary(); } else { loadMessages(true); }
-  });
   initRangePicker();
   $('btn-reload').addEventListener('click', () => {
     if (state.view === 'messages') { loadDates().then(() => loadMessages(true)); }
@@ -786,12 +809,8 @@ async function onReplyClick(key) {
       id: key,
     });
     if (loc && loc.date) {
-      if (loc.date !== state.date) {
-        const sel = $('sel-date');
-        if (sel && !Array.from(sel.options).some((o) => o.value === loc.date)) {
-          await loadDates();
-        }
-        sel.value = loc.date;
+      if (loc.date !== state.range.start || loc.date !== state.range.end) {
+        applyRange(loc.date, loc.date, loc.date, true);
         state.offset = 0;
         await loadMessages(true);
       }
@@ -833,6 +852,8 @@ async function runSearch() {
       q: $('q').value || '',
       user: $('q-user').value || '',
       limit: 200,
+      start: state.range.start || '',
+      end: state.range.end || '',
     });
     const items = (data && data.items) || [];
     if (!items.length) {
@@ -852,12 +873,7 @@ async function runSearch() {
 }
 
 async function gotoHit(date, seq) {
-  const sel = $('sel-date');
-  if (sel && !Array.from(sel.options).some((o) => o.value === date)) {
-    await loadDates();
-  }
-  if (sel) sel.value = date;
-  if (date) state.date = date;
+  if (date) applyRange(date, date, date, true);
   state.offset = 0;
   await loadMessages(true);
   switchView('messages');
@@ -868,12 +884,17 @@ async function genSummary(force) {
   syncTargetFromSelect();
   if (!state.target) return;
   const box = $('summary-text');
+  const sumDate = curDate();
+  if (!sumDate) {
+    box.innerHTML = '<span class="muted">请先在上方选择日期范围</span>';
+    return;
+  }
   box.innerHTML = '<span class="muted">正在生成…（队列串行，请稍等）</span>';
   try {
     const res = await apiPost('summary', {
       chat: state.target.chat,
       target_id: state.target.target,
-      date: ($('sel-date') && $('sel-date').value) || state.date || '',
+      date: sumDate,
       trend: !!($('sum-trend') && $('sum-trend').checked),
       force: !!force,
     });
@@ -985,18 +1006,22 @@ async function loadSummary(force) {
 
 function renderSummary() {
   const box = $('summary-text');
-  const date = ($('sel-date') && $('sel-date').value) || state.date || '';
-  if (date) state.date = date;
+  const date = curDate();
+  const multi = !!(state.range.start && state.range.end && state.range.start !== state.range.end);
+  const btnGen = $('btn-sum-gen');
+  if (btnGen) btnGen.textContent = date ? ('总结 ' + date) : '总结所选日期';
   const cur = (state.summaries || {})[date];
   const t = state.target;
   const label = t ? ((t.chat === 'private' ? '私聊 ' : '群聊 ') + t.target) : '';
   if (box) {
     if (cur) {
-      box.innerHTML = '<div class="summary-title">' + esc(label + ' · ' + date + '（已生成）') + '</div>'
+      box.innerHTML = '<div class="summary-title">' + esc(label + ' · ' + date
+      + (multi ? '（范围结束日）' : '') + '（已生成）') + '</div>'
         + '<div class="summary-body">' + esc(cur) + '</div>';
     } else {
       box.innerHTML = '<span class="muted">' + esc(label)
-        + (date ? (' · ' + esc(date)) : '') + ' 还没有总结，可点上方「总结所选日期」生成。'
+        + (date ? (' · ' + esc(date)) : '') + ' 还没有总结，可点上方按钮生成。'
+        + (multi ? '（当前范围含多天，总结按结束日 ' + esc(date) + ' 生成）' : '')
         + '</span>';
     }
   }
