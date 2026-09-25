@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import shutil
 import time
 from datetime import datetime, timedelta
@@ -15,12 +14,18 @@ try:
         json_response,
         request,
     )
+    try:
+        # file_response 仅在较新的 AstrBot 中提供：单独降级，避免因缺它导致整个页面 API 不可用
+        from astrbot.api.web import file_response
+    except Exception:  # pragma: no cover - 旧版 AstrBot 无 file_response
+        file_response = None
     _WEB_AVAILABLE = True
 except Exception:  # pragma: no cover - 旧版 AstrBot 无插件页面 API
     _WEB_AVAILABLE = False
+    file_response = None
 
 PLUGIN_NAME = "astrbot_plugin_chat_history_archiver"
-PLUGIN_VERSION = "2.3.2"
+PLUGIN_VERSION = "2.3.3"
 
 # 消息段类型 → 占位符（不导出媒体文件）
 _SEG_PLACEHOLDER = {
@@ -143,8 +148,8 @@ def migrate_dir(src, dst) -> str:
     try:
         if not any(src.iterdir()):
             src.rmdir()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"[{PLUGIN_NAME}] 清理旧数据目录 {src} 失败（可忽略）：{e}")
     msg = (f"旧数据目录 {src} 已迁移到 {dst}"
            f"（移动 {moved} 项，跳过 {skipped} 项）")
     logger.info(f"[{PLUGIN_NAME}] {msg}")
@@ -238,8 +243,8 @@ class NapcatHistoryExporter(Star):
                 data.setdefault("group", {})
                 data.setdefault("private", {})
                 return data
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 读取别名文件失败（将按无别名处理）：{e}")
         return {"group": {}, "private": {}}
 
     def _save_aliases(self) -> None:
@@ -475,7 +480,7 @@ class NapcatHistoryExporter(Star):
             return 0
         groups: dict = {}
         friends: dict = {}
-        for pid, qq, client in clients:
+        for _pid, _qq, client in clients:
             try:
                 for g in (await client.call_action("get_group_list") or []):
                     gid = str(g.get("group_id", ""))
@@ -1440,7 +1445,8 @@ class NapcatHistoryExporter(Star):
         try:
             self.aliases = self._load_aliases()
             self._sync_alias_config()
-            asyncio.create_task(self._refresh_names_safe())
+            # 持有任务引用，避免被 GC 提前回收（RUF006）
+            self._names_task = asyncio.create_task(self._refresh_names_safe())
         except Exception as e:
             logger.error(f"[别名] 初始化异常: {e}")
         # v2.3.0: 注册插件页面（控制台）API
@@ -2037,7 +2043,6 @@ class NapcatHistoryExporter(Star):
 
     async def _api_messages(self):
         q = request.query
-        raw = (q.get("target") or "").strip()
         date = (q.get("date") or "").strip()
         if date and not self._safe_date(date):
             return error_response("date 非法（应为 YYYY-MM-DD）", status_code=400)
@@ -2369,6 +2374,8 @@ class NapcatHistoryExporter(Star):
 
     async def _api_avatar_file(self):
         """头像文件（file_response）：供直接下载或另存使用。"""
+        if file_response is None:
+            return error_response("当前 AstrBot 版本不支持文件下载接口", status_code=501)
         q = request.query
         uid = (q.get("user_id") or "").strip()
         if not self._safe_id(uid):
@@ -2382,8 +2389,9 @@ class NapcatHistoryExporter(Star):
             try:
                 fp.parent.mkdir(parents=True, exist_ok=True)
                 fp.write_bytes(data)
-            except Exception:
-                pass
+            except Exception as e:
+                # 写盘失败不影响本次响应：file_response 仍可直接读已有缓存
+                logger.debug(f"[{PLUGIN_NAME}] 写入头像缓存失败：{e}")
         return file_response(str(fp), filename=f"{uid}.png", content_type="image/png")
 
     # ---------------- v2.3.0：昵称映射（@ 替名 / 引用预览） ----------------
@@ -2592,7 +2600,8 @@ class NapcatHistoryExporter(Star):
             finally:
                 self._manual_archiving = False
 
-        asyncio.create_task(run())
+        # 持有任务引用，避免被 GC 提前回收（RUF006）
+        self._manual_task = asyncio.create_task(run())
         return json_response({"ok": True, "started": True})
 
     def _ensure_summary_worker(self):
@@ -2662,8 +2671,8 @@ class NapcatHistoryExporter(Star):
                         out.append(json.loads(line))
                     except Exception:
                         continue
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 读取归档文件失败：{fp}：{e}")
         return out
 
     @staticmethod
@@ -2697,8 +2706,8 @@ class NapcatHistoryExporter(Star):
                 if p.exists():
                     try:
                         parts.append(p.read_text(encoding="utf-8"))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"[{PLUGIN_NAME}] 读取历史总结失败：{p}：{e}")
             if parts:
                 history = "\n\n【历史总结】\n" + "\n---\n".join(parts)[-4000:]
         try:
@@ -2745,8 +2754,8 @@ class NapcatHistoryExporter(Star):
                     continue
                 try:
                     parts.append(f"【{d}｜{p.stem}】" + p.read_text(encoding="utf-8"))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"[{PLUGIN_NAME}] 读取每日总结失败：{p}：{e}")
         if not parts:
             raise RuntimeError("还没有每日总结可汇总（请先在「统计」里生成某天总结）")
         try:
