@@ -140,7 +140,7 @@ archive_bots:
 | auto_export | true | 自动归档开关：开启后定时循环增量归档 |
 | interval_seconds | 120 | 定时循环间隔（最小 30s）|
 | startup_verify | true | 启动时自动补全缺口：检查最近 N 天归档，自动补齐缺失/不全的记录 |
-| verify_days | 3 | 启动检查范围（1-30 天），建议不超过历史文件保留天数 |
+| verify_days | 3 | 启动检查范围（1-180 天），建议不超过历史文件保留天数 |
 | whitelist | []（全部）| 自动归档群白名单：仅名单内的群会被定时循环导出；留空=全部群。手动归档不受限 |
 | auto_export_friends | false | 定时模式是否同时导出私聊 |
 | archive_bots | []（全部）| 多 bot 归档白名单：留空=全部 aiocqhttp 实例；填平台实例 id 或登录 QQ 号=只归档指定 bot |
@@ -152,11 +152,11 @@ archive_bots:
 | ui_default_tab | overview | 控制台默认打开的页面（overview=总览 / messages=消息预览 / stats=统计 / search=搜索 / config=配置）|
 | ui_messages_page_size | 50 | 消息预览每页条数（1-200）|
 | ui_avatar_cache | true | 缓存发言人头像（减少重复请求）|
-| llm_summary_enabled | false | LLM 每日总结开关（默认关闭；开启后才按下面的时间自动生成）|
+| llm_summary_enabled | false | LLM 每日总结开关（默认关闭；开启后每天在 `llm_summary_time` 自动生成各目标当日总结）|
 | llm_summary_provider | （空）| 总结使用的模型；留空=使用默认模型 |
-| llm_summary_time | 23:30 | 每日自动总结时间（HH:MM）|
+| llm_summary_time | 23:30 | 每日自动总结时间（HH:MM）。每天只跑一次；插件停机期间错过的日期不会补跑 |
 | llm_summary_trend_days | 3 | 趋势合并天数：生成总结时参考最近几天的历史总结 |
-| llm_briefing_enabled | false | 总览「昨日简报」开关（默认关闭）|
+| llm_briefing_enabled | false | 总览「昨日简报」开关（默认关闭；在每日总结之后生成一次）|
 | llm_summary_max_chars | 1000 | 单群（每个目标）每日总结字数上限（100-5000）|
 | llm_briefing_max_chars | 2000 | 总览简报字数上限（200-8000）|
 

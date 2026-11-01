@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .git/
+
+# 打包产物（由 tests/_package.py 生成，不入库）
+dist/

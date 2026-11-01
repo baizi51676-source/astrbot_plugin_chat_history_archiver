@@ -1,6 +1,5 @@
 import asyncio
 import json
-import shutil
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,55 +23,93 @@ except Exception:  # pragma: no cover - 旧版 AstrBot 无插件页面 API
     _WEB_AVAILABLE = False
     file_response = None
 
+# 纯逻辑子模块（P3-1 拆分）。
+# 注意：插件类与本文件内的 @filter.llm_tool 方法必须留在 main.py——
+# AstrBot 以 cls.__module__ 作为 star_map 键、按 "<插件模块路径>." 前缀
+# 归属/清理 LLM 工具，搬到子模块会导致插件无法加载或工具丢失归属。
+from .core import aggregate as _aggregate
+from .core import aliases as _aliases
+from .core import atomic as _atomic
+from .core import backend as _backend_mod
+from .core import paths as _paths
+from .core import pager as _pager
+from .core import schedule as _schedule
+from .core import store as _store
+from .core import targets as _targets
+from .core import text as _text
+from .core import verify as _verify
+from .core.paths import LEGACY_EXPORT_DIR
+from .core.text import SEG_PLACEHOLDER as _SEG_PLACEHOLDER
+
 PLUGIN_NAME = "astrbot_plugin_chat_history_archiver"
-PLUGIN_VERSION = "2.3.3"
 
-# 消息段类型 → 占位符（不导出媒体文件）
-_SEG_PLACEHOLDER = {
-    "image": "[图片]",
-    "face": "[表情]",
-    "record": "[语音]",
-    "video": "[视频]",
-    "reply": "[引用消息]",
-    "forward": "[合并转发]",
-    "json": "[卡片消息]",
-    "xml": "[卡片消息]",
-}
 
-# ===== 数据目录（v2.3.1：插件数据统一放在 data/plugin_data/<插件名> 下）=====
-LEGACY_EXPORT_DIR = "data/workspaces/napcat_exports"
+def _read_plugin_version(default: str = "2.4.0") -> str:
+    """P3-2: 版本号的单一来源 = metadata.yaml（AstrBot 也用这个文件）。
+
+    此前 `PLUGIN_VERSION` 与 `metadata.yaml` 需手工双份同步，极易漂移
+    （页面 footer 读常量、市场/WebUI 读 yaml，两边不一致就会出现
+    「页面显示 v2.3.3、插件列表显示 2.4.0」）。这里启动时读一次，
+    读不到才退回内置默认值。
+    """
+    from pathlib import Path
+
+    try:
+        meta = Path(__file__).resolve().parent / "metadata.yaml"
+        for line in meta.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if s.startswith("version:"):
+                v = s.split(":", 1)[1].strip().strip("'\"")
+                if v:
+                    return v
+    except Exception:
+        pass
+    return default
+
+
+PLUGIN_VERSION = _read_plugin_version()
+
+#: P1-6：启动检查天数上限（v2.4.0 由 30 提到 180）
+VERIFY_DAYS_MAX = 180
+
+
+def _count_lines(fp: Path) -> int:
+    """统计行数（P2-1：供 to_thread 调用；按字节数换行，远快于逐行迭代）。"""
+    return _store._count_newlines(fp)
+
+
+def _read_text_file(fp: Path) -> str:
+    """读取文本文件（P2-1：供 asyncio.to_thread 调用）。"""
+    return fp.read_text(encoding="utf-8")
+
+
+class _EmptyData(RuntimeError):
+    """空数据状态（不是故障）：应返回 200 + 友好文案，而非 500。
+
+    P2-11：现场「还没有每日总结可汇总」曾被当作 ERRO 级故障打日志并返回 500，
+    前端只能显示「简报失败」，用户误以为插件出错。
+    """
 
 
 def _plugin_data_root() -> Path:
-    """返回 AstrBot 的 data/plugin_data 目录（优先官方 API，逐级降级）。"""
-    try:
-        from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
-        return Path(get_astrbot_plugin_data_path())
-    except Exception:
-        pass
-    try:
-        from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-        return Path(get_astrbot_data_path()) / "plugin_data"
-    except Exception:
-        pass
-    return Path("data") / "plugin_data"
+    """返回 AstrBot 的 data/plugin_data 目录（委托 core.paths）。"""
+    return _paths.plugin_data_root()
 
 
 def _plugin_dir_name() -> str:
-    return Path(__file__).resolve().parent.name
+    return _paths.plugin_dir_name(__file__)
 
 
 def _default_export_dir() -> Path:
-    return _plugin_data_root() / _plugin_dir_name()
+    return _paths.default_export_dir(__file__)
 
 
 def _legacy_export_dir_path() -> Path:
-    # <root>/data/plugin_data -> <root>/data -> data/workspaces/napcat_exports
-    return _plugin_data_root().parent / "workspaces" / "napcat_exports"
+    return _paths.legacy_export_dir_path()
 
 
 def resolve_export_dir(raw):
-    """解析 export_dir 配置。
+    """解析 export_dir 配置（委托 core.paths.resolve_export_dir）。
 
     规则（v2.3.1，满足插件市场「数据持久化位置」规范）：
     - 留空或仍是旧默认值 → 用新默认 data/plugin_data/<插件名>（并返回旧目录用于迁移）
@@ -82,82 +119,16 @@ def resolve_export_dir(raw):
 
     返回 (最终目录, 需要迁移的旧目录或 None)
     """
-    default_dir = _default_export_dir()
-    raw = str(raw or "").strip().replace("\\", "/")
-    if raw in ("", LEGACY_EXPORT_DIR, "./" + LEGACY_EXPORT_DIR,
-               LEGACY_EXPORT_DIR + "/"):
-        return default_dir, _legacy_export_dir_path()
-    p = Path(raw).expanduser()
-    if p.is_absolute():
-        try:
-            inside = str(p.resolve()).startswith(
-                str(_plugin_data_root().resolve()))
-        except Exception:
-            inside = False
-        if not inside:
-            logger.warning(
-                f"[{PLUGIN_NAME}] export_dir 位于 plugin_data 之外：{p}；"
-                "该位置不受 AstrBot 备份/迁移覆盖，建议改为 "
-                f"{_plugin_data_root() / _plugin_dir_name()}")
-        return p, None
-    norm = raw[2:] if raw.startswith("./") else raw
-    root = _plugin_data_root().parent.parent  # AstrBot 根目录
-    if norm.startswith("data/"):
-        target = root / norm
-        try:
-            legacy_root = (root / "data" / "workspaces").resolve()
-            if str(target.resolve()).startswith(str(legacy_root)):
-                return default_dir, target
-        except Exception:
-            pass
-        return target, None
-    # 其它相对路径：约束到插件数据目录下
-    return default_dir / norm.strip("/"), None
+    return _paths.resolve_export_dir(raw, __file__)
 
 
 def migrate_dir(src, dst) -> str:
-    """把旧数据目录内容逐项搬到新目录（已存在的项跳过），返回日志文案。"""
-    if src is None:
-        return ""
-    try:
-        src = src.resolve()
-        dst = dst.resolve()
-    except Exception:
-        return ""
-    if src == dst or not src.is_dir():
-        return ""
-    try:
-        items = sorted(src.iterdir())
-    except Exception:
-        return ""
-    if not items:
-        return ""
-    moved = 0
-    skipped = 0
-    for it in items:
-        target = dst / it.name
-        if target.exists():
-            skipped += 1
-            continue
-        try:
-            shutil.move(str(it), str(target))
-            moved += 1
-        except Exception as e:
-            skipped += 1
-            logger.warning(f"[{PLUGIN_NAME}] 迁移 {it} 失败：{e}")
-    try:
-        if not any(src.iterdir()):
-            src.rmdir()
-    except Exception as e:
-        logger.debug(f"[{PLUGIN_NAME}] 清理旧数据目录 {src} 失败（可忽略）：{e}")
-    msg = (f"旧数据目录 {src} 已迁移到 {dst}"
-           f"（移动 {moved} 项，跳过 {skipped} 项）")
-    logger.info(f"[{PLUGIN_NAME}] {msg}")
-    return msg
+    """把旧数据目录内容逐项搬到新目录（委托 core.paths.migrate_dir）。"""
+    return _paths.migrate_dir(src, dst)
 
 
 
-class NapcatHistoryExporter(Star):
+class ChatHistoryArchiver(Star):
     """NapCat / SnowLuma 历史聊天记录导出插件（OneBot v11 / aiocqhttp 适配）。
 
     通过扩展 API（get_group_msg_history / get_friend_msg_history）
@@ -170,6 +141,11 @@ class NapcatHistoryExporter(Star):
     - 图片、表情、语音等媒体不导出，使用 [图片]/[表情]/[语音] 等占位符
     - 按天分文件：napcat_<群号>_YYYY-MM-DD.jsonl（私聊 napcat_private_<QQ>_*.jsonl）
     - 增量导出：记录每个目标的最新 message_seq，只拉新消息，不重复写入
+
+    P3-1（v2.4.0）：纯逻辑已下沉到 ``core/``（paths/text/store/backend/
+    aliases/aggregate/pager）。本类保留在 ``main.py`` 是硬性要求——
+    AstrBot 以 ``cls.__module__`` 为 ``star_map`` 键、按插件模块路径前缀
+    归属/清理 LLM 工具，类搬走会导致插件无法加载。
     """
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -182,38 +158,139 @@ class NapcatHistoryExporter(Star):
         # 旧目录（data/workspaces/napcat_exports）存在时自动迁移
         self._migrate_msg = migrate_dir(_legacy_dir, self.export_dir)
         self._split_merged_files()  # v1.2.0: v1.1.0 单文件自动拆回按天文件
-        self.auto_export = bool(config.get("auto_export", True))
-        self.interval = max(30, int(config.get("interval_seconds", 120)))
-        self.batch = max(1, min(int(config.get("count_per_batch", 50)), 200))
-        self.auto_friends = bool(config.get("auto_export_friends", False))
-        self.admin_only = bool(config.get("admin_only", True))
-        # v1.3.0: 自动归档白名单 / 历史自动清理（仅循环导出模式生效）
-        self.whitelist = [str(x).strip() for x in (config.get("whitelist") or [])
-                          if str(x).strip()]
-        self.auto_clean = bool(config.get("auto_clean", True))
-        self.clean_days = max(1, int(config.get("clean_days", 14)))
         self.state_file = self.export_dir / "state.json"
         self._state: dict = self._load_state()
         self._client = None
         self._task: asyncio.Task | None = None
         self._last_clean: datetime | None = None  # v1.3.1: 上次自动清理时间（每12h一次）
-        # v1.5.0: 多 bot / SnowLuma
-        self.archive_bots = [str(x).strip() for x in (config.get("archive_bots") or [])
-                             if str(x).strip()]  # 留空=归档全部 aiocqhttp 实例
-        self.backend_cfg = str(config.get("backend", "auto") or "auto").strip().lower()
-        self._backend: str | None = None      # 后端探测结果缓存: "napcat" / "snowluma"
         self._qq_cache: dict = {}             # 平台实例 id -> 登录 QQ号（get_login_info）
         self._qq_cache_ts: float = 0.0
-        # v2.1.0: 启动归档检查（自动补全缺失日期/不全记录）
-        self.startup_verify = bool(config.get("startup_verify", True))
-        self.verify_days = max(1, min(int(config.get("verify_days", 3) or 3), 30))
+        self._backend: str | None = None      # 后端探测结果缓存: "napcat" / "snowluma"
         self._verify_task: asyncio.Task | None = None
         self._file_lock = asyncio.Lock()      # 写入段串行化（并发任务防护）
+        # P1-5: 启动检查进度落盘（可续跑）
+        self._verify_file = self.export_dir / "verify_state.json"
+        self._verify_state = self._load_verify_state()
+        self._sched_file = self.export_dir / "schedule_state.json"
+        self._sched_state = self._load_sched_state()
+        self._sched_task: asyncio.Task | None = None
+        # P2-1: 行数索引持久化（重载后不必重新逐行统计 57k 行）
+        self._row_cache_file = self.export_dir / "row_index.json"
+        self._row_cache: dict = self._load_row_cache()
+        self._row_cache_dirty = False
+        self._warm_task: asyncio.Task | None = None
         # v2.2.0: 对话别名注册系统
         self.aliases_file = self.export_dir / "aliases.json"
         self.aliases = self._load_aliases()
-        self._alias_cfg = [str(x).strip() for x in (config.get("aliases") or [])
+        # P1-2: 所有「可热更新」的配置项集中在这里解析。
+        # 页面保存配置后调用 _apply_runtime_config() 重新计算，
+        # 不再需要「重载插件」才生效（现场「文件 60 天 / 运行 14 天」即此因）。
+        self._apply_runtime_config(initial=True)
+
+    def _apply_runtime_config(self, initial: bool = False) -> dict:
+        """把 self.config 里的可热更新项重新解析到运行态属性。
+
+        Returns:
+            实际发生变化的字段 {字段: (旧值, 新值)}，供日志与页面提示。
+
+        注意：`export_dir` 不在此列——它涉及数据目录迁移与 state_file/
+        aliases_file 等路径绑定，改它必须重载插件（见 _api_config_save 的提示）。
+        """
+        cfg = self.config
+        before = {}
+        def _mark(name):
+            before[name] = getattr(self, name, None)
+
+        for name in ("auto_export", "interval", "batch", "auto_friends",
+                     "admin_only", "whitelist", "private_whitelist",
+                     "auto_clean", "clean_days",
+                     "archive_bots", "backend_cfg", "startup_verify",
+                     "verify_days", "llm_summary_enabled", "llm_summary_time",
+                     "llm_briefing_enabled"):
+            _mark(name)
+
+        self.auto_export = bool(cfg.get("auto_export", True))
+        self.interval = max(30, int(cfg.get("interval_seconds", 120)))
+        self.batch = max(1, min(int(cfg.get("count_per_batch", 50)), 200))
+        self.auto_friends = bool(cfg.get("auto_export_friends", False))
+        self.admin_only = bool(cfg.get("admin_only", True))
+        # v1.3.0: 自动归档白名单 / 历史自动清理（仅循环导出模式生效）
+        self.whitelist = [str(x).strip() for x in (cfg.get("whitelist") or [])
+                          if str(x).strip()]
+        # v2.4.0: 私聊归档白名单（留空=只巡已登记目标，避免僵尸账号空调用）
+        self.private_whitelist = [
+            str(x).strip() for x in (cfg.get("private_whitelist") or [])
+            if str(x).strip()]
+        self.auto_clean = bool(cfg.get("auto_clean", True))
+        self.clean_days = max(1, int(cfg.get("clean_days", 14)))
+        # v1.5.0: 多 bot 归档范围
+        self.archive_bots = [str(x).strip() for x in (cfg.get("archive_bots") or [])
+                             if str(x).strip()]
+        self.backend_cfg = str(cfg.get("backend", "auto") or "auto").strip().lower()
+        # v2.1.0: 启动归档检查
+        self.startup_verify = bool(cfg.get("startup_verify", True))
+        # P1-6: 上限 180，超范围告警（不再静默截断）
+        _verify_days_raw = int(cfg.get("verify_days", 3) or 3)
+        self.verify_days = max(1, min(_verify_days_raw, VERIFY_DAYS_MAX))
+        if _verify_days_raw != self.verify_days:
+            logger.warning(
+                f"[{PLUGIN_NAME}] verify_days={_verify_days_raw} 超出允许范围，"
+                f"实际生效 {self.verify_days}（允许 1–{VERIFY_DAYS_MAX}）")
+        # v2.4.0 (P1-1): 每日定时总结/简报
+        self.llm_summary_enabled = bool(cfg.get("llm_summary_enabled", False))
+        self.llm_summary_time = _schedule.parse_hhmm(
+            cfg.get("llm_summary_time", "23:30"))
+        self.llm_briefing_enabled = bool(cfg.get("llm_briefing_enabled", False))
+        # v2.2.0: 别名配置项缓存
+        self._alias_cfg = [str(x).strip() for x in (cfg.get("aliases") or [])
                            if str(x).strip()]
+
+        changed = {}
+        for name, old in before.items():
+            new = getattr(self, name, None)
+            if old != new:
+                changed[name] = (old, new)
+        return changed
+
+    async def _sync_background_tasks(self) -> None:
+        """P1-2: 按当前运行态开关同步后台任务（配置热生效的补充）。
+
+        `interval` / `whitelist` / `batch` 等属性每轮都被读取，改完即生效；
+        但 `auto_export` 决定「_auto_loop 要不要跑」，所以开关切换时必须
+        真的启动/停止任务，否则页面显示已保存、行为却不变。
+        """
+        # 自动归档主循环
+        if self.auto_export and self._task is None:
+            self._task = asyncio.create_task(self._auto_loop())
+            logger.info(f"[页面] 自动归档已启用（间隔 {self.interval}s）")
+        elif not self.auto_export and self._task is not None:
+            task = self._task
+            self._task = None
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"[{PLUGIN_NAME}] 停止自动归档时异常（可忽略）：{e}")
+            logger.info("[页面] 自动归档已停用（仅在被 LLM 工具触发时归档）")
+
+        # 定时总结独立轮询：仅当 auto_export 关闭时由它负责
+        need_sched_loop = ((self.llm_summary_enabled or self.llm_briefing_enabled)
+                           and not self.auto_export)
+        if need_sched_loop and self._sched_task is None:
+            self._sched_task = asyncio.create_task(self._sched_loop())
+            logger.info("[页面] 定时总结轮询已启动")
+        elif not need_sched_loop and self._sched_task is not None:
+            task = self._sched_task
+            self._sched_task = None
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"[{PLUGIN_NAME}] 停止总结轮询时异常（可忽略）：{e}")
 
     # ---------------------------------------------------------------
     # 内部工具
@@ -233,19 +310,198 @@ class NapcatHistoryExporter(Star):
         except Exception as e:
             logger.error(f"保存导出状态失败: {e}")
 
+    # ---------------- v2.4.0 (P1-1)：定时总结调度状态 ----------------
+
+    def _load_row_cache(self) -> dict:
+        """P2-1: 行数索引持久化（重载插件后不必重新逐行统计）。
+
+        内存缓存在重载后失效，而 57k 行首轮统计约 1.8s——这就是「重载后
+        第一次打开总览要等很久」的原因。这里把 (mtime, size) → rows 落盘，
+        重载后直接复用；文件变动时按 mtime/size 自动失效重算。
+        """
+        try:
+            data = json.loads(self._row_cache_file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {}
+            out = {}
+            for k, v in data.items():
+                if isinstance(v, list) and len(v) == 3:
+                    out[str(k)] = (v[0], v[1], int(v[2]))
+            return out
+        except Exception:
+            return {}
+
+    def _save_row_cache(self) -> None:
+        """把行数索引原子落盘（失败不影响主流程）。"""
+        cache = getattr(self, "_row_cache", None)
+        if not isinstance(cache, dict) or not cache:
+            return
+        try:
+            _atomic.atomic_write_text(
+                self._row_cache_file,
+                json.dumps({k: list(v) for k, v in cache.items()},
+                           ensure_ascii=False))
+        except Exception as e:
+            logger.debug(f"[{PLUGIN_NAME}] 保存行数索引失败（可忽略）：{e}")
+
+    async def _warm_row_index(self) -> None:
+        """P2-1: 后台预热行数索引（全新安装时首次打开总览不再等 3.5s）。
+
+        只在索引为空（全新安装 / 索引文件丢失）时才跑，避免每次启动都
+        白白扫一遍 57k 行。在线程池里执行，不阻塞事件循环。
+        """
+        try:
+            if self._row_cache:
+                logger.debug("[页面] 行数索引已存在，跳过预热")
+                return
+            files = sorted(self.export_dir.glob("napcat_*.jsonl"))
+            if not files:
+                return
+            logger.info(f"[页面] 后台预热行数索引（{len(files)} 个文件）…")
+            await asyncio.to_thread(self._overview_data)
+            await asyncio.to_thread(self._save_row_cache)
+            self._row_cache_dirty = False
+            logger.info("[页面] 行数索引预热完成，首次打开总览不再需要全量统计")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"[页面] 行数索引预热失败（可忽略）：{e}")
+
+    def _load_sched_state(self) -> dict:
+        """读取调度状态（记录上次执行日期，重载后不重复跑同一晚）。"""
+        try:
+            data = json.loads(self._sched_file.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_sched_state(self) -> None:
+        try:
+            self._sched_file.write_text(
+                json.dumps(self._sched_state, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+        except Exception as e:
+            logger.error(f"[总结] 保存调度状态失败: {e}")
+
+    # ---------------- v2.4.0 (P1-5)：启动检查续跑状态 ----------------
+
+    def _load_verify_state(self) -> dict:
+        """读取启动检查进度（已完成项 + 窗口指纹）。"""
+        try:
+            data = json.loads(self._verify_file.read_text(encoding="utf-8"))
+            return _verify.normalize_loaded(data)
+        except Exception:
+            return _verify.new_state()
+
+    def _save_verify_state(self) -> None:
+        try:
+            self._verify_file.write_text(
+                json.dumps(self._verify_state, ensure_ascii=False),
+                encoding="utf-8")
+        except Exception as e:
+            logger.error(f"[归档检查] 保存检查进度失败: {e}")
+
+    async def _run_daily_summaries(self, date: str) -> int:
+        """对所有已归档目标生成指定日期的总结。返回成功条数。
+
+        走与页面相同的队列（串行），避免并发打爆模型额度。
+        """
+        targets = self._scan_archived_targets()
+        if not targets:
+            logger.info("[总结] 暂无已归档目标，跳过定时总结")
+            return 0
+        self._ensure_summary_worker()
+        ok = 0
+        for chat, tid in targets:
+            # 当天没有消息的目标直接跳过（不产生空总结，也不打 ERROR）
+            if not self._day_records(chat, tid, date):
+                continue
+            fut = asyncio.get_running_loop().create_future()
+            job = {"chat": chat, "tid": tid, "date": date,
+                   "trend": True, "future": fut}
+            await self._summary_queue.put(job)
+            try:
+                await asyncio.wait_for(fut, timeout=300)
+                ok += 1
+            except _EmptyData:
+                pass
+            except Exception as e:
+                logger.error(f"[总结] {chat}:{tid} {date} 定时总结失败: {e}")
+        logger.info(f"[总结] 定时总结完成：{date}，成功 {ok}/{len(targets)} 个目标")
+        return ok
+
+    async def _run_daily_briefing(self) -> bool:
+        """生成一次简报（汇总最近的每日总结）。"""
+        self._ensure_summary_worker()
+        fut = asyncio.get_running_loop().create_future()
+        job = {"kind": "brief", "days": _schedule.briefing_days(
+            datetime.now(), self.config.get("llm_summary_trend_days", 3)),
+            "future": fut}
+        await self._summary_queue.put(job)
+        try:
+            await asyncio.wait_for(fut, timeout=360)
+            return True
+        except _EmptyData as e:
+            logger.info(f"[简报] 定时简报跳过：{e}")
+            return False
+        except Exception as e:
+            logger.error(f"[简报] 定时简报失败: {e}")
+            return False
+
+    async def _sched_loop(self) -> None:
+        """v2.4.0 (P1-1): 独立的定时总结轮询。
+
+        仅当 auto_export 关闭时才启用（auto_export 开时由 _auto_loop 顺带调用，
+        避免两处同时触发导致重复执行）。
+        """
+        while True:
+            try:
+                await self._daily_sched_check()
+            except Exception as e:
+                logger.error(f"[总结] 定时调度异常: {e}")
+            await asyncio.sleep(self.interval)
+
+    async def _daily_sched_check(self) -> None:
+        """调度轮询：每轮检查是否到了总结/简报的时刻（每天各最多一次）。"""
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+
+        if _schedule.should_run(now, self.llm_summary_time,
+                                self._sched_state.get("summary_date", ""),
+                                self.llm_summary_enabled):
+            date = _schedule.summary_date(now)
+            logger.info(f"[总结] 到达定时点 {self.llm_summary_time.strftime('%H:%M')}，"
+                        f"开始生成 {date} 的每日总结")
+            # 先落盘日期再执行：即便中途失败也不会在同一晚反复重试烧额度
+            self._sched_state["summary_date"] = today
+            self._save_sched_state()
+            try:
+                await self._run_daily_summaries(date)
+            except Exception as e:
+                logger.error(f"[总结] 定时总结异常: {e}")
+
+        # 简报：在总结之后跑（同一天只跑一次），确保能汇总到当日总结
+        if _schedule.should_run(now, self.llm_summary_time,
+                                self._sched_state.get("brief_date", ""),
+                                self.llm_briefing_enabled):
+            logger.info("[简报] 开始生成定时简报")
+            self._sched_state["brief_date"] = today
+            self._save_sched_state()
+            try:
+                await self._run_daily_briefing()
+            except Exception as e:
+                logger.error(f"[简报] 定时简报异常: {e}")
+
     # ---------------- 对话别名注册系统（v2.2.0） ----------------
 
     def _load_aliases(self) -> dict:
         """读取 aliases.json（不存在时返回空结构）。"""
         try:
             data = json.loads(self.aliases_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                data.setdefault("group", {})
-                data.setdefault("private", {})
-                return data
+            return _aliases.normalize_loaded(data)
         except Exception as e:
             logger.warning(f"[{PLUGIN_NAME}] 读取别名文件失败（将按无别名处理）：{e}")
-        return {"group": {}, "private": {}}
+        return _aliases.empty_aliases()
 
     def _save_aliases(self) -> None:
         try:
@@ -256,213 +512,78 @@ class NapcatHistoryExporter(Star):
             logger.error(f"[别名] 保存 aliases.json 失败: {e}")
 
     def _alias_entry(self, chat: str, tid: str, create: bool = False):
-        """获取（或创建）某目标的别名条目。"""
-        tid = str(tid)
-        bucket = self.aliases.get(chat)
-        if bucket is None:
-            if not create:
-                return None
-            bucket = self.aliases.setdefault(chat, {})
-        ent = bucket.get(tid)
-        if ent is None and create:
-            ent = {"name": "", "aliases": [], "updated": ""}
-            bucket[tid] = ent
-        return ent if isinstance(ent, dict) else None
+        """获取（或创建）某目标的别名条目（委托 core.aliases）。"""
+        return _aliases.get_entry(self.aliases, chat, tid, create)
 
     def _register_name(self, chat: str, tid: str, name: str) -> None:
         """记录/更新目标名称（群名或好友昵称）。"""
-        name = (name or "").strip()
-        if not name:
-            return
-        ent = self._alias_entry(chat, tid, create=True)
-        if ent is None:
-            return
-        if ent.get("name") != name:
-            ent["name"] = name
-            ent["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if _aliases.register_name(self.aliases, chat, tid, name):
             self._save_aliases()
 
     def _aliases_of(self, chat: str, tid: str) -> list:
-        ent = self._alias_entry(chat, tid) or {}
-        return [str(a) for a in (ent.get("aliases") or []) if str(a).strip()]
+        return _aliases.aliases_of(self.aliases, chat, tid)
 
     def _target_label(self, chat: str, tid: str) -> str:
         """目标展示标签：「名称/别名 (群号或QQ号)」。"""
-        ent = self._alias_entry(chat, tid) or {}
-        name = str(ent.get("name") or "").strip()
-        als = self._aliases_of(chat, tid)
-        prefix = name or (als[0] if als else ("群聊" if chat == "group" else "私聊"))
-        tag = f"群{tid}" if chat == "group" else f"QQ{tid}"
-        return f"{prefix} ({tag})"
+        return _aliases.target_label(self.aliases, chat, tid)
 
     def _alias_add(self, chat: str, tid: str, alias: str):
         """新增别名。返回错误信息；成功返回 None。"""
-        alias = (alias or "").strip()
-        if not alias:
-            return "别名不能为空"
-        if alias.isdigit():
-            return "别名不能是纯数字（会与群号/QQ号冲突）"
-        for c, bucket in self.aliases.items():
-            for t, ent in (bucket or {}).items():
-                if c == chat and str(t) == str(tid):
-                    continue
-                if not isinstance(ent, dict):
-                    continue
-                if alias in (ent.get("aliases") or []):
-                    return f"别名「{alias}」已被 {self._target_label(c, t)} 使用"
-        ent = self._alias_entry(chat, tid, create=True)
-        if ent is None:
-            return "创建别名条目失败"
-        aliases = ent.setdefault("aliases", [])
-        if alias not in aliases:
-            aliases.append(alias)
-        ent["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._save_aliases()
-        return None
+        err = _aliases.add(self.aliases, chat, tid, alias)
+        if err is None:
+            self._save_aliases()
+        return err
 
     def _alias_remove(self, chat: str, tid: str, alias: str):
         """删除别名。返回错误信息；成功返回 None。"""
-        alias = (alias or "").strip()
-        ent = self._alias_entry(chat, tid)
-        if ent is None:
-            return "该目标还没有登记（先归档一次或添加别名）"
-        aliases = ent.get("aliases") or []
-        if alias not in aliases:
-            return (f"该目标没有别名「{alias}」"
-                    f"（当前：{'、'.join(aliases) if aliases else '无'}）")
-        aliases.remove(alias)
-        ent["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._save_aliases()
-        return None
+        err = _aliases.remove(self.aliases, chat, tid, alias)
+        if err is None:
+            self._save_aliases()
+        return err
+
     def _alias_rename(self, chat: str, tid: str, old: str, new: str):
         """修改别名（把 old 改成 new）。返回错误信息；成功返回 None。"""
-        old = (old or "").strip()
-        new = (new or "").strip()
-        if not old or not new:
-            return "修改别名需要提供「旧别名」和「新别名」"
-        if old == new:
-            return "新别名与旧别名相同，无需修改"
-        if new.isdigit():
-            return "别名不能是纯数字（会与群号/QQ号冲突）"
-        ent = self._alias_entry(chat, tid)
-        if ent is None:
-            return "该目标还没有登记（先归档一次或添加别名）"
-        aliases = ent.get("aliases") or []
-        if old not in aliases:
-            return (f"该目标没有别名「{old}」"
-                    f"（当前：{'、'.join(aliases) if aliases else '无'}）")
-        for c, bucket in self.aliases.items():
-            for t, ent2 in (bucket or {}).items():
-                if not isinstance(ent2, dict):
-                    continue
-                if c == chat and str(t) == str(tid):
-                    continue
-                if new in (ent2.get("aliases") or []):
-                    return f"别名「{new}」已被 {self._target_label(c, t)} 使用"
-        if new in aliases:
-            return f"本目标已有别名「{new}」（可先删除「{old}」）"
-        aliases[aliases.index(old)] = new
-        ent["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._save_aliases()
-        return None
+        err = _aliases.rename(self.aliases, chat, tid, old, new)
+        if err is None:
+            self._save_aliases()
+        return err
 
     def _resolve_target(self, text: str, prefer_chat: str = ""):
         """把「群号 / QQ号 / 别名」解析为 (chat, tid)。
         返回 None = 未找到；返回 ("AMBIGUOUS", hits) = 别名歧义。"""
-        s = (text or "").strip()
-        if not s:
-            return None
-        if s.isdigit():
-            if prefer_chat:
-                return (prefer_chat, s)
-            for c in ("group", "private"):
-                if self._alias_entry(c, s):
-                    return (c, s)
-            return ("group", s)
-        low = s.lower()
-        hits: list = []
-        for c, bucket in self.aliases.items():
-            for t, ent in (bucket or {}).items():
-                if not isinstance(ent, dict):
-                    continue
-                for a in (ent.get("aliases") or []):
-                    if str(a).lower() == low:
-                        hits.append((c, str(t)))
-        if not hits:
-            return None
-        if len(hits) == 1:
-            return hits[0]
-        if prefer_chat:
-            same = [h for h in hits if h[0] == prefer_chat]
-            if len(same) == 1:
-                return same[0]
-        return ("AMBIGUOUS", hits)
+        return _aliases.resolve(self.aliases, text, prefer_chat)
 
     def _alias_hint(self, text: str) -> str:
         """别名歧义时的用户提示。"""
-        r = self._resolve_target(text)
-        if isinstance(r, tuple) and len(r) == 2 and r[0] == "AMBIGUOUS":
-            opts = "；".join(self._target_label(c, t) for c, t in r[1])
-            return (f"⚠️ 别名「{text.strip()}」对应多个目标：{opts}。"
-                    f"请改用群号/QQ号指定。")
-        return ""
+        return _aliases.hint(self.aliases, text)
 
     def _resolve_gid(self, raw: str, kind: str = "group"):
         """工具入口的目标解析：支持群号或别名。
         返回 (gid, None)；失败时 (None, 错误提示)。"""
-        s = (raw or "").strip()
-        if s.isdigit():
-            return (s, None)
-        r = self._resolve_target(s, prefer_chat=kind)
-        if r is None:
-            name = "群" if kind == "group" else "好友"
-            return (None, f"❌ 未找到{name}「{s}」：尚未归档或别名不存在"
-                          f"（可先用群号/QQ号归档一次）")
-        if isinstance(r, tuple) and len(r) == 2 and r[0] == "AMBIGUOUS":
-            return (None, self._alias_hint(s))
-        if r[0] != kind:
-            return (None, f"❌「{s}」对应的是"
-                          f"{'私聊' if r[0] == 'private' else '群聊'}目标，"
-                          f"请改用对应的"
-                          f"{'QQ号' if r[0] == 'private' else '群号'}。")
-        return (r[1], None)
+        return _aliases.resolve_gid(self.aliases, raw, kind)
 
     def _sync_alias_config(self) -> None:
         """把配置项 aliases（形如「别名,群号」）合并进 aliases.json。"""
         added = 0
         for item in self._alias_cfg:
-            raw = str(item).strip()
-            if not raw:
-                continue
-            alias, target = "", raw
-            if "," in raw or "，" in raw:
-                alias, _, target = raw.replace("，", ",").partition(",")
-                alias, target = alias.strip(), target.strip()
-            if not target.isdigit():
+            alias, target = _aliases.parse_config_item(item)
+            if not target or not target.isdigit():
                 continue
             chat = "group"
-            for c in ("group", "private"):
+            for c in _aliases.CHATS:
                 if self._alias_entry(c, target):
                     chat = c
                     break
             self._alias_entry(chat, target, create=True)
-            if alias:
-                if self._alias_add(chat, target, alias) is None:
-                    added += 1
+            if alias and self._alias_add(chat, target, alias) is None:
+                added += 1
         if added:
             logger.info(f"[别名] 已从配置同步 {added} 个别名")
 
     async def _flush_alias_config(self) -> None:
         """把别名回写配置项并保存（保持 WebUI 显示同步）。"""
-        lines = []
-        for chat in ("group", "private"):
-            for tid, ent in (self.aliases.get(chat) or {}).items():
-                if not isinstance(ent, dict):
-                    continue
-                for a in (ent.get("aliases") or []):
-                    lines.append(f"{a},{tid}")
         try:
-            self.config["aliases"] = lines
+            self.config["aliases"] = _aliases.to_config_lines(self.aliases)
         except Exception:
             return
         try:
@@ -553,9 +674,7 @@ class NapcatHistoryExporter(Star):
             for fp in files:
                 try:
                     size += fp.stat().st_size
-                    with open(fp, encoding="utf-8",
-                              errors="replace") as f:
-                        rows += sum(1 for _ in f)
+                    rows += _store._count_newlines(fp)  # P2-1：字节计数
                 except Exception:
                     continue
             total += rows
@@ -568,25 +687,8 @@ class NapcatHistoryExporter(Star):
         return "\n".join(lines)
 
     def _scan_archived_targets(self) -> list:
-        """v2.1.0: 扫描导出目录，收集已有归档记录的目标 [(chat, target_id)]。"""
-        import re as _re
-        out: list = []
-        seen: set = set()
-        pat = _re.compile(r"^napcat_(private_)?(\d+)_\d{4}-\d{2}-\d{2}\.jsonl$")
-        try:
-            for f in self.export_dir.glob("napcat_*_????-??-??.jsonl"):
-                m = pat.match(f.name)
-                if not m:
-                    continue
-                chat = "private" if m.group(1) else "group"
-                tid = m.group(2)
-                key = (chat, tid)
-                if key not in seen:
-                    seen.add(key)
-                    out.append(key)
-        except Exception as e:
-            logger.error(f"[归档检查] 扫描导出目录失败: {e}")
-        return out
+        """v2.1.0: 扫描导出目录，收集已有归档记录的目标（委托 core.store）。"""
+        return _store.scan_archived_targets(self.export_dir)
 
     def _is_allowed(self, event: AstrMessageEvent) -> bool:
         if not self.admin_only:
@@ -637,20 +739,27 @@ class NapcatHistoryExporter(Star):
             out.append(p)
         return out
 
-    async def _bot_qq(self, client, pid: str) -> str:
-        """获取某平台实例的登录 QQ 号（self_id）；失败返回空串。结果缓存 600s。"""
+    async def _bot_qq(self, client, pid: str, cache_key: str = "") -> str:
+        """获取某平台实例的登录 QQ 号（self_id）；失败返回空串。结果缓存 600s。
+
+        P2-5: 缓存键不能只用平台实例 id —— 若 `meta().id` 缺失，多个实例
+        都会得到空串 ""，导致后写的 QQ 覆盖前一个，`archive_bots` 过滤与
+        `self_id` 路由全部出错。调用方可传 `cache_key`（通常带实例身份）
+        作为兜底；为空时退回 `pid`。
+        """
+        key = cache_key or pid
         now = time.time()
         if now - self._qq_cache_ts > 600:
             self._qq_cache = {}
             self._qq_cache_ts = now
-        if pid in self._qq_cache:
-            return self._qq_cache[pid]
+        if key in self._qq_cache:
+            return self._qq_cache[key]
         try:
             info = await client.call_action("get_login_info")
             qq = str((info or {}).get("user_id") or "")
         except Exception:
             qq = ""
-        self._qq_cache[pid] = qq
+        self._qq_cache[key] = qq
         return qq
 
     def _bot_enabled(self, pid: str, qq: str) -> bool:
@@ -663,7 +772,7 @@ class NapcatHistoryExporter(Star):
     async def _get_clients(self) -> list:
         """返回 [(platform_id, qq, client)]：所有“启用归档”的 aiocqhttp 实例。"""
         out = []
-        for p in self._aiocqhttp_platforms():
+        for idx, p in enumerate(self._aiocqhttp_platforms()):
             try:
                 pid = str(p.meta().id or "")
                 client = p.get_client()
@@ -671,10 +780,14 @@ class NapcatHistoryExporter(Star):
                 continue
             if client is None:
                 continue
-            qq = await self._bot_qq(client, pid)
+            # P2-5: pid 缺失时用「该实例在列表中的位置」兜底，
+            # 避免多个实例共用空串键而串号
+            cache_key = pid if pid else f"idx:{idx}"
+            qq = await self._bot_qq(client, pid, cache_key=cache_key)
             if not self._bot_enabled(pid, qq):
                 logger.info(f"[NapCatExporter] bot 未启用归档"
-                            f"（archive_bots 过滤）: 实例id={pid or '?'} qq={qq or '未知'}")
+                            f"（archive_bots 过滤）: 实例id={pid or cache_key} "
+                            f"qq={qq or '未知'}")
                 continue
             out.append((pid, qq, client))
         return out
@@ -714,193 +827,42 @@ class NapcatHistoryExporter(Star):
 
     @staticmethod
     def _probe_backend(msgs: list) -> str | None:
-        """auto 后端探测：
+        """auto 后端探测（委托 core.backend.probe_backend）：
         NapCat : 消息带 real_seq 字段，且 message_seq == message_id；
         SnowLuma: 无 real_seq，message_id 为 int32 哈希（≠单调会话号 message_seq）。"""
-        if not msgs:
-            return None
-        m0 = msgs[0]
-        if not isinstance(m0, dict):
-            return None
-        if m0.get("real_seq") is not None:
-            return "napcat"
-        seq = m0.get("message_seq")
-        mid = m0.get("message_id")
-        if seq is not None and mid is not None and str(seq) != str(mid):
-            return "snowluma"
-        return "napcat"
+        return _backend_mod.probe_backend(msgs)
 
     def _segments_to_text(self, segments, nickmap=None) -> str:
-        """消息段 → 文本。图片/表情等替换为占位符，不导出媒体。
+        """消息段 → 文本（委托 core.text.segments_to_text）。
 
         v2.3.0：若提供昵称映射（QQ号 → 昵称），@ 消息会渲染为 @昵称，
         否则保留 [At:QQ号] 占位（页面端会用同一映射再做兜底替换）。
         """
-        if isinstance(segments, str):
-            return segments
-        parts = []
-        for seg in segments or []:
-            if not isinstance(seg, dict):
-                continue
-            t = seg.get("type", "")
-            data = seg.get("data") or {}
-            if t == "text":
-                parts.append(data.get("text", ""))
-            elif t == "at":
-                qq = str(data.get("qq", "") or "")
-                nm = (nickmap or {}).get(qq, "")
-                if nm:
-                    parts.append("@" + str(nm))
-                else:
-                    parts.append(f"[At:{qq}]")
-            elif t == "file":
-                parts.append(f"[文件:{data.get('name', '')}]")
-            elif t in _SEG_PLACEHOLDER:
-                parts.append(_SEG_PLACEHOLDER[t])
-            else:
-                parts.append(f"[{t}]")
-        return "".join(parts)
+        return _text.segments_to_text(segments, nickmap)
 
     def _fmt_record(self, msg: dict, chat: str, target_id: str, nickmap=None) -> dict:
-        """OneBot 消息 → JSONL 行。"""
-        sender = msg.get("sender") or {}
-        try:
-            ts = int(msg.get("time") or 0)
-            t = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            t = ""
-        return {
-            "t": t,
-            "chat": chat,
-            "group_id": target_id,
-            "user_id": str(sender.get("user_id", "")),
-            "nickname": (sender.get("card") or sender.get("nickname") or "").strip(),
-            "seq": msg.get("message_seq") or msg.get("message_id") or 0,
-            "content": self._segments_to_text(msg.get("message", ""), nickmap),
-            "reply": self._reply_of(msg),
-        }
+        """OneBot 消息 → JSONL 行（委托 core.text.fmt_record）。"""
+        return _text.fmt_record(msg, chat, target_id, nickmap)
 
     @staticmethod
     def _reply_of(msg: dict) -> dict | None:
-        """抽取引用（reply）消息信息，供页面“点击跳转”与引用条展示。"""
-        segments = msg.get("message")
-        if isinstance(segments, str):
-            return None
-        for seg in segments or []:
-            if not isinstance(seg, dict):
-                continue
-            if seg.get("type") != "reply":
-                continue
-            data = seg.get("data") or {}
-            out = {}
-            for key in ("id", "message_id", "seq", "text", "qq", "nickname", "time"):
-                val = data.get(key)
-                if val is None or val == "":
-                    continue
-                if key == "time":
-                    try:
-                        out["time"] = datetime.fromtimestamp(int(val)).strftime(
-                            "%Y-%m-%d %H:%M:%S")
-                        continue
-                    except Exception:
-                        pass
-                out[key] = str(val)
-            return out or None
-        return None
+        """抽取引用（reply）消息信息（委托 core.text.reply_of）。"""
+        return _text.reply_of(msg)
 
     def _date_of(self, msg: dict) -> str:
-        try:
-            return datetime.fromtimestamp(int(msg.get("time") or 0)) \
-                .strftime("%Y-%m-%d")
-        except Exception:
-            return "unknown"
+        return _text.date_of(msg)
 
     def _target_path(self, chat: str, target_id: str, date: str) -> Path:
         # 按天分文件：napcat_<群号>_YYYY-MM-DD.jsonl（私聊 napcat_private_<QQ>_*）
-        if chat == "group":
-            return self.export_dir / f"napcat_{target_id}_{date}.jsonl"
-        return self.export_dir / f"napcat_private_{target_id}_{date}.jsonl"
+        return _store.target_path(self.export_dir, chat, target_id, date)
 
     def _split_merged_files(self) -> None:
-        """v1.2.0 迁移：若存在 v1.1.0 单文件 napcat_<群号>.jsonl，
-        按行内 t 字段拆回按天文件 napcat_<群号>_YYYY-MM-DD.jsonl，
-        随后删除单文件（避免与按天分文件模式冲突）。
-        """
-        try:
-            if not self.export_dir.is_dir():
-                return
-            import re as _re
-            for p in sorted(self.export_dir.glob("napcat_*.jsonl")):
-                if p.name == "state.json":
-                    continue
-                m = _re.match(r"napcat_(private_)?(\d+)\.jsonl$", p.name)
-                if not m:
-                    continue  # 已是按天文件，跳过
-                prefix = m.group(1) or ""
-                gid = m.group(2)
-                try:
-                    lines = [ln for ln in
-                             p.read_text(encoding="utf-8", errors="replace")
-                             .splitlines() if ln.strip()]
-                except Exception as e:
-                    logger.error(f"[NapCatExporter] 拆分读取失败 {p.name}: {e}")
-                    continue
-                if not lines:
-                    p.unlink(missing_ok=True)
-                    continue
-                # 按行内 t 字段的前 10 位（YYYY-MM-DD）分组
-                by_date: dict = {}
-                for ln in lines:
-                    d = ""
-                    try:
-                        d = str(json.loads(ln).get("t", ""))[:10]
-                    except Exception:
-                        pass
-                    by_date.setdefault(d or "unknown", []).append(ln)
-                for date, day_lines in by_date.items():
-                    target = self.export_dir / \
-                        f"napcat_{prefix}{gid}_{date}.jsonl"
-                    try:
-                        with open(target, "a", encoding="utf-8") as f:
-                            f.write("\n".join(day_lines) + "\n")
-                        logger.info(f"[NapCatExporter] 拆分: {p.name} → "
-                                    f"{target.name}（{len(day_lines)}行）")
-                    except Exception as e:
-                        logger.error(f"[NapCatExporter] 拆分写入失败 "
-                                     f"{target.name}: {e}")
-                p.unlink(missing_ok=True)
-                logger.info(f"[NapCatExporter] 单文件已删除: {p.name}")
-        except Exception as e:
-            logger.error(f"[NapCatExporter] 单文件拆分迁移异常: {e}")
+        """v1.2.0 迁移：单文件拆回按天文件（委托 core.store.split_merged_files）。"""
+        _store.split_merged_files(self.export_dir)
 
     def _merge_write(self, path: Path, records: list) -> int:
-        """v1.3.3: 合并写入——读现有文件行 + 新记录，按 seq 去重、
-        按 t 排序后整体重写。文件自愈：不依赖内存去重，永不重复、有序。
-        v2.1.0: 返回实际新增条数（合并后新增，重复消息不计入）。"""
-        merged: dict = {}
-        if path.exists():
-            for ln in path.read_text(encoding="utf-8",
-                                     errors="replace").splitlines():
-                if not ln.strip():
-                    continue
-                try:
-                    r = json.loads(ln)
-                    key = str(r.get("seq") or
-                              (r.get("user_id", "") + r.get("t", "")))
-                    merged[key] = r
-                except Exception:
-                    continue
-        before = len(merged)  # v2.1.0: 合并前已有（去重）条数基线
-        for r in records:
-            key = str(r.get("seq") or
-                      (r.get("user_id", "") + r.get("t", "")))
-            merged[key] = r  # 新记录覆盖旧记录
-        ordered = sorted(merged.values(),
-                         key=lambda r: str(r.get("t", "")))
-        with open(path, "w", encoding="utf-8") as f:
-            for r in ordered:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        return max(0, len(ordered) - before)
+        """v1.3.3 合并写入（委托 core.store.merge_write）。"""
+        return _store.merge_write(path, records)
 
     async def _fetch(self, action: str, key: str, target_id: str,
                      start: int, count: int, client=None) -> list:
@@ -986,31 +948,22 @@ class NapcatHistoryExporter(Star):
 
     @staticmethod
     def _seq_of(msg: dict) -> int:
-        return msg.get("message_seq") or msg.get("message_id") or 0
+        return _backend_mod.seq_of(msg)
 
     @staticmethod
     def _anchor_of(msg: dict) -> int | None:
-        """v1.3.4: 翻页定位锚点——优先 real_seq（会话内序号，单调递增，
-        NapCat 内部用其定位），否则回退 message_id。"""
-        rs = msg.get("real_seq")
-        if rs is not None:
-            try:
-                return int(str(rs).strip())
-            except Exception:
-                pass
-        return None
+        """v1.3.4: 翻页定位锚点（委托 core.backend.anchor_of）——优先 real_seq
+        （会话内序号，单调递增，NapCat 内部用其定位），否则回退 message_id。"""
+        return _backend_mod.anchor_of(msg)
 
     @staticmethod
     def _mid_of(msg: dict) -> str:
         """消息唯一 ID（用于去重）。"""
-        return str(msg.get("message_id") or msg.get("message_seq") or "")
+        return _backend_mod.mid_of(msg)
 
     @staticmethod
     def _time_of(msg: dict) -> int:
-        try:
-            return int(msg.get("time") or 0)
-        except Exception:
-            return 0
+        return _backend_mod.time_of(msg)
 
     async def _export_target(self, chat: str, target_id: str,
                              limit: int = 0, today_only: bool = False,
@@ -1059,118 +1012,27 @@ class NapcatHistoryExporter(Star):
                 datetime.now().date(), datetime.min.time()).timestamp())
         # NapCat 扩展 API：message_seq=0 表示从最新消息开始，只能往回翻页
         start = 0
-        fetched: list = []
-        guard = 0
-        # v2.1.0: ignore_seen 用于回溯补全（启动检查/手动回溯）——文件才是
-        # 唯一权威，若按 state 的已归档 id 过滤，已删文件的记录将无法重建；
-        # 页间防重叠仍由 local_seen 在本轮内维护
-        local_seen = set() if (ignore_seen and start_ts > 0) else set(seen)
-        consecutive_empty = 0  # v1.3.4: 连续无新增页数，防翻页死循环
+        pager = _pager.Pager(
+            limit=limit, today_only=today_only, start_ts=start_ts,
+            end_ts=end_ts, last_t=last_t, seen=seen,
+            ignore_seen=ignore_seen, today_start=today_start)
         while True:
-            guard += 1
-            if guard > 600:  # 防御：单次最多翻 600 页
-                logger.warning(f"[NapCatExporter] {target_id} 翻页超过 600 页，强制停止")
-                break
             msgs = await self._fetch(action, key, target_id, start,
-                                      self.batch, client=client)
-            if not msgs:
+                                     self.batch, client=client)
+            decision = pager.decide_page(msgs, self._backend_now())
+            if decision.reason == "超过 600 页":
+                logger.warning(f"[NapCatExporter] {target_id} 翻页超过 600 页，强制停止")
+            if decision.stop:
                 break
-            if limit > 0:
-                # 按需导出：收集未写过的消息，达到 limit 条为止
-                fresh = [m for m in msgs
-                         if self._mid_of(m) not in local_seen]
-                fetched.extend(fresh)
-                local_seen.update(self._mid_of(m) for m in fresh)
-                if len(fetched) >= limit:
-                    break
-                # 本页没有新消息且包含旧消息 → 没有更多可导出的了
-                if not fresh and any(self._time_of(m) <= last_t for m in msgs):
-                    break
-                if not fresh:
-                    consecutive_empty += 1
-                    if consecutive_empty >= 3:
-                        break
-                else:
-                    consecutive_empty = 0
-            else:
-                # 回溯时间段导出（手动归档历史，不推进游标）
-                if start_ts > 0:
-                    zone = [m for m in msgs
-                            if end_ts <= 0 or self._time_of(m) <= end_ts]
-                    fresh = [m for m in zone
-                             if self._time_of(m) >= start_ts
-                             and self._mid_of(m) not in local_seen]
-                    fetched.extend(fresh)
-                    local_seen.update(self._mid_of(m) for m in fresh)
-                    if any(self._time_of(m) < start_ts for m in msgs):
-                        break  # 已到时间段起点
-                    if zone and not fresh:
-                        consecutive_empty += 1
-                        if consecutive_empty >= 3:
-                            break
-                    elif zone and fresh:
-                        consecutive_empty = 0
-                    # zone 为空（页内全是 end_ts 之后的消息）→ 不计数，继续往前翻
-                else:
-                    # 增量：只保留 time > last_t 且未写过的消息
-                    fresh = [m for m in msgs
-                             if self._time_of(m) > last_t
-                             and self._mid_of(m) not in local_seen]
-                    if today_only:
-                        # 自动归档只归档当天
-                        fresh = [m for m in fresh
-                                 if self._time_of(m) >= today_start]
-                    fetched.extend(fresh)
-                    local_seen.update(self._mid_of(m) for m in fresh)
-                    if today_only:
-                        # 遇当天之前（含昨天及更早）的消息 → 本页已到当天边界
-                        if any(self._time_of(m) < today_start for m in msgs):
-                            break
-                    else:
-                        if any(self._time_of(m) <= last_t for m in msgs):
-                            break
-                    if not fresh:
-                        consecutive_empty += 1
-                        if consecutive_empty >= 3:
-                            break
-                    else:
-                        consecutive_empty = 0
-            # 向前翻页（拿更早的）
-            if self._backend_now() == "snowluma":
-                # SnowLuma：锚点=本页最旧消息的 message_id（int32 哈希，须
-                # 原值回传，由其内部定位 sequence 往前翻；reverse_order 默认
-                # true 会包含锚点消息本身，靠 local_seen 去重）
-                anchor_msg = min(
-                    msgs, key=lambda m: (self._time_of(m), self._seq_of(m)))
-                anchor_id = anchor_msg.get("message_id")
-                if anchor_id is None or anchor_id == "":
-                    break
-                start = int(anchor_id)
-                if start == 0 or len(fetched) >= 5000:
-                    break  # 哈希锚点为 0（无有效 id）或已达上限 → 停止
-                # 本页只有锚点一条 → 已翻到最早，下页必然重复/为空
-                if (len(msgs) == 1
-                        and self._mid_of(msgs[0]) == self._mid_of(anchor_msg)):
-                    break
-            else:
-                # NapCat：v1.3.4 优先用 real_seq（单调递增，传 min-1 精确定位
-                # 更早消息）；无 real_seq 时回退页内最小 message_seq（真实存在，
-                # NapCat 返回其之前更早的消息）
-                anchors = [a for a in (self._anchor_of(m) for m in msgs)
-                           if a is not None]
-                if anchors:
-                    start = min(anchors) - 1
-                else:
-                    start = min(self._seq_of(m) for m in msgs)
-                if start < 1 or len(fetched) >= 5000:
-                    break
+            if decision.next_anchor is not None:
+                start = decision.next_anchor
+        fetched = pager.fetched
         if not fetched:
             return 0
         # v2.1.0: 写入段串行化（启动归档检查 / 手动 / 循环任务并发防护）
         async with self._file_lock:
             # 按 time 排序
-            new = sorted(fetched[:limit] if limit > 0 else fetched,
-                         key=self._time_of)
+            new = pager.final_records(limit)
             # 按天分文件写入（v1.3.3: 统一合并-去重-排序-重写，文件自愈）
             written = 0
             by_date: dict = {}
@@ -1194,20 +1056,21 @@ class NapcatHistoryExporter(Star):
                 self._save_nicks(chat, target_id)
             # 更新游标：time 边界 + 最近 5000 个已写 message_id
             max_t = max(self._time_of(m) for m in new)
-            new_ids = [self._mid_of(m) for m in new if self._mid_of(m)]
-            seen |= set(new_ids)
+            merged_ids = pager.merge_ids(seen)
             cur = self._state.setdefault(chat, {})
             if today_only:
                 # v1.3.2: 当天模式游标不推进（固定为今天 0 点 -1 秒），
                 # 每轮都尝试拉取当天全部消息，配合 message_id 去重：
                 # 翻页失败时也不漏"最新"消息，翻页可用时能补全当天更早的
-                cur[target_id] = {"t": today_start - 1,
-                                  "ids": list(seen)[-5000:]}
+                cur[target_id] = {"t": today_start - 1, "ids": merged_ids}
             elif start_ts > 0:
                 # v1.4.0: 回溯时间段归档不推进游标（不影响后续增量），仅更新去重 ids
-                cur[target_id] = {"t": last_t, "ids": list(seen)[-5000:]}
+                cur[target_id] = {"t": last_t, "ids": merged_ids}
             else:
-                cur[target_id] = {"t": max_t, "ids": list(seen)[-5000:]}
+                # P2-7: limit 模式下可能抓到「更早但从未见过」的消息，
+                # 直接写 max_t 会让游标回退，下一轮重复拉取（浪费 API 配额）。
+                # 游标必须单调不减。
+                cur[target_id] = {"t": max(last_t, max_t), "ids": merged_ids}
             self._save_state()
             return written
 
@@ -1254,6 +1117,8 @@ class NapcatHistoryExporter(Star):
                 if gid in seen_targets:
                     continue  # 同一轮其他 bot 已导出（同群消息一致）
                 seen_targets.add(gid)
+                n = 0  # P0-1: 前置初始化，避免导出抛异常时 total += n 引发 NameError
+                       # 中断整轮归档（该异常会让本轮剩余目标与私聊全部跳过）
                 try:
                     n = await self._export_target(
                         "group", gid, today_only=apply_rules,
@@ -1270,14 +1135,19 @@ class NapcatHistoryExporter(Star):
                 except Exception as e:
                     logger.error(f"[{bot_tag}] 获取好友列表失败: {e}")
                     friends = []
-                for f in friends or []:
-                    uid = str(f.get("user_id", ""))
-                    if not uid:
-                        continue
-                    self._register_name("private", uid, f.get("nickname") or "")
+                # v2.4.0: 按「私聊归档白名单」筛选，不再无差别遍历全部好友
+                # （僵尸账号每轮空调用既浪费配额又刷 WARN）
+                picked = self._pick_private_targets(friends)
+                if picked:
+                    logger.info(f"[{bot_tag}] 私聊巡检 {len(picked)} 个目标"
+                                + ("（白名单模式）" if self.private_whitelist
+                                   else "（仅已登记目标）"))
+                for uid, nick in picked:
+                    self._register_name("private", uid, nick)
                     if uid in seen_targets:
                         continue
                     seen_targets.add(uid)
+                    n = 0  # P0-1: 同群分支，前置初始化避免 NameError 中断本轮
                     try:
                         n = await self._export_target(
                             "private", uid, today_only=apply_rules,
@@ -1290,42 +1160,52 @@ class NapcatHistoryExporter(Star):
         logger.info(f"定时导出完成，本轮新增 {total} 条（目录: {self.export_dir.resolve()}）")
         return total
 
+    def _pick_private_targets(self, friends: list) -> list:
+        """决定本轮要巡检哪些私聊目标（v2.4.0 私聊白名单）。
+
+        规则：
+        - `private_whitelist` 非空 → **严格**只用名单内的 QQ（即便后端好友列表里没有）
+        - `private_whitelist` 留空 → 只巡视「已登记」的目标：有归档文件、有游标、
+          或有别名条目。这样已清理 / 已失效的僵尸账号不会被每轮反复空调用。
+
+        为什么不再遍历全部好友：SnowLuma/NapCat 的 `get_friend_list` 会返回
+        大量无聊天记录的账号，逐个 `get_friend_msg_history` 只会空返回并刷 WARN，
+        白白消耗 API 配额（现网 `2490530663` 即此情况）。
+        """
+        names = {}
+        for f in friends or []:
+            uid = str((f or {}).get("user_id", "") or "")
+            if uid:
+                names[uid] = (f or {}).get("nickname") or ""
+
+        ids = set()
+        if self.private_whitelist:
+            for raw in self.private_whitelist:
+                s = str(raw).strip()
+                if s:
+                    ids.add(s)
+        else:
+            # 已登记：别名条目
+            for tid in (self.aliases.get("private") or {}):
+                ids.add(str(tid))
+            # 已登记：游标
+            for tid in (self._state.get("private") or {}):
+                ids.add(str(tid))
+            # 已登记：有归档文件
+            for chat, tid in self._scan_archived_targets():
+                if chat == "private":
+                    ids.add(str(tid))
+        # 名单里有、但后端没返回昵称的，仍要巡检（好友列表可能不含它）
+        return [(uid, names.get(uid, "")) for uid in sorted(ids)]
+
     def _cleanup_old_files(self) -> None:
-        """v1.3.0: 自动清理过期历史文件（仅循环导出模式调用）。
+        """v1.3.0: 自动清理过期历史文件（委托 core.store.cleanup_old_files）。
 
         删除文件名日期早于（今天 - clean_days）的 napcat_*_YYYY-MM-DD.jsonl；
         手动归档（protected）过的目标文件不清理。
         """
-        if not self.auto_clean:
-            return
-        cutoff = (datetime.now().date()
-                  - timedelta(days=self.clean_days)).strftime("%Y-%m-%d")
-        protected = set()
-        for g in self._state.get("protected", {}).get("group", []) or []:
-            protected.add(f"napcat_{g}_")
-        for u in self._state.get("protected", {}).get("private", []) or []:
-            protected.add(f"napcat_private_{u}_")
-        import re as _re
-        removed = 0
-        for f in self.export_dir.glob("napcat_*_????-??-??.jsonl"):
-            m = _re.match(
-                r"napcat_(private_)?(\d+)_(\d{4}-\d{2}-\d{2})\.jsonl$", f.name)
-            if not m:
-                continue
-            prefix = f"napcat_{m.group(1) or ''}{m.group(2)}_"
-            if prefix in protected:
-                continue  # 手动归档过的目标，不自动清理
-            fdate = m.group(3)
-            if fdate < cutoff:
-                try:
-                    f.unlink(missing_ok=True)
-                    logger.info(f"[NapCatExporter] 自动清理过期文件: "
-                                f"{f.name}（早于 {cutoff}）")
-                    removed += 1
-                except Exception as e:
-                    logger.error(f"[NapCatExporter] 清理文件失败 {f.name}: {e}")
-        if removed:
-            logger.info(f"[NapCatExporter] 本轮自动清理 {removed} 个过期文件")
+        _store.cleanup_old_files(self.export_dir, self._state, self.clean_days,
+                                 self.auto_clean)
 
     async def _startup_verify_once(self) -> int:
         """v2.1.0: 启动归档检查——对已归档目标逐天回溯补全最近 verify_days 天缺口。
@@ -1335,10 +1215,31 @@ class NapcatHistoryExporter(Star):
           - 整天空洞（文件缺失但该天有消息）→ 生成补全；
           - 记录不全（文件存在但缺少部分消息）→ 补齐差值。
         超出自动清理保留期的天跳过；后端（SL/NapCat）本地无记录的消息无法补。
+
+        P1-5（v2.4.0）：
+        - **可续跑**：每个 (目标, 日期) 完成后立即落盘 verify_state.json，
+          重载/中断后从断点继续，不再从头重跑数小时。
+        - **工作量可见**：日志输出「N 目标 × M 天 = K 次检查」，并报告进度。
+        - **窗口指纹**：目标集合与天数未变且上次已跑完 → 直接跳过，避免
+          每次「保存配置 / 重载插件」都触发一次长任务。
+        - **低优先级**：每项之间让出事件循环（0.3s），并可被 cancel 中断。
         """
         if not self.startup_verify:
             return 0
-        logger.info(f"[归档检查] 启动检查开始：范围最近 {self.verify_days} 天")
+        targets = self._scan_archived_targets()
+        if not targets:
+            logger.info("[归档检查] 导出目录暂无已归档目标，跳过检查")
+            return 0
+
+        today = datetime.now().date()
+        wk = _verify.window_key(targets, self.verify_days)
+        # 窗口未变且上次已完整跑完 → 本次直接跳过
+        if (self._verify_state.get("window") == wk
+                and self._verify_state.get("finished_at")):
+            logger.info(f"[归档检查] 本轮窗口与上次相同（{_verify.format_workload(targets, self.verify_days)}），"
+                        f"上次已完成于 {self._verify_state['finished_at']}，跳过重复检查")
+            return 0
+
         # 等平台连接就绪（最多 3 次尝试，间隔 10s）
         clients = []
         for i in range(3):
@@ -1353,10 +1254,7 @@ class NapcatHistoryExporter(Star):
         if not clients:
             logger.warning("[归档检查] 未获取到可用的 aiocqhttp 客户端，跳过本次检查")
             return 0
-        targets = self._scan_archived_targets()
-        if not targets:
-            logger.info("[归档检查] 导出目录暂无已归档目标，跳过检查")
-            return 0
+
         # 群 → 首选客户端映射（多 bot 场景：优先用能看到该群的实例拉取）
         gid2client: dict = {}
         for pid, qq, client in clients:
@@ -1368,40 +1266,70 @@ class NapcatHistoryExporter(Star):
                 gid = str(g.get("group_id", ""))
                 if gid and gid not in gid2client:
                     gid2client[gid] = (pid, qq, client)
-        today = datetime.now().date()
-        cutoff = today - timedelta(days=self.clean_days)  # 自动清理保留期边界
+
+        # 规划本轮要检查的项（跳过已完成 / 超出保留期）
+        items, skipped_done, skipped_retention = _verify.plan_items(
+            targets, self.verify_days, today, self._verify_state,
+            auto_clean=self.auto_clean, clean_days=self.clean_days)
+        est = _verify.format_workload(targets, self.verify_days)
+        logger.info(f"[归档检查] 启动检查开始：{est}"
+                    f"（已完成 {skipped_done} 项已跳过"
+                    + (f"，{skipped_retention} 项超出保留期" if skipped_retention else "")
+                    + f"，本次待检查 {len(items)} 项）")
+        if not items:
+            logger.info("[归档检查] 所有项均已完成，本次无需检查")
+            self._verify_state["window"] = wk
+            self._verify_state["finished_at"] = datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S")
+            self._save_verify_state()
+            return 0
+
         total = 0
         t0 = time.time()
-        for back in range(self.verify_days):
-            day = today - timedelta(days=back)
-            if self.auto_clean and day < cutoff:
-                logger.info(f"[归档检查] {day} 已超出保留期"
-                            f"（{self.clean_days} 天），跳过补全")
-                continue
+        ok = 0
+        for idx, it in enumerate(items, 1):
+            day = it["day"]
+            chat, tid = it["chat"], it["tid"]
+            label = f"群 {tid}" if chat == "group" else f"私聊 {tid}"
+            if chat == "group" and tid in gid2client:
+                pid, qq, client = gid2client[tid]
+            else:
+                pid, qq, client = clients[0]
+            bot_tag = f"bot[{qq or pid or '?'}]"
             start_ts = int(datetime.combine(day, datetime.min.time()).timestamp())
             end_ts = int(datetime.combine(day, datetime.max.time()).timestamp())
             if day == today:
                 end_ts = int(time.time())
-            for chat, tid in targets:
-                label = f"群 {tid}" if chat == "group" else f"私聊 {tid}"
-                if chat == "group" and tid in gid2client:
-                    pid, qq, client = gid2client[tid]
-                else:
-                    pid, qq, client = clients[0]
-                bot_tag = f"bot[{qq or pid or '?'}]"
-                try:
-                    n = await self._export_target(
-                        chat, tid, start_ts=start_ts, end_ts=end_ts,
-                        client=client, bot_tag=bot_tag, ignore_seen=True)
-                except Exception as e:
-                    logger.error(f"[归档检查] {label} {day} 检查失败: {e}")
-                    n = 0
-                if n:
-                    logger.info(f"[归档检查] {label} {day} 补齐 {n} 条")
-                total += n
-                await asyncio.sleep(0.3)
-        logger.info(f"[归档检查] 完成：{len(targets)} 个目标 × 最多 "
-                    f"{self.verify_days} 天，共补齐 {total} 条，"
+            try:
+                n = await self._export_target(
+                    chat, tid, start_ts=start_ts, end_ts=end_ts,
+                    client=client, bot_tag=bot_tag, ignore_seen=True)
+            except asyncio.CancelledError:
+                # 被重载/停用中断：已完成的项已落盘，下次可续跑
+                logger.info(f"[归档检查] 被中断（已完成 {ok}/{len(items)} 项，"
+                            f"下次可从断点继续）")
+                raise
+            except Exception as e:
+                logger.error(f"[归档检查] {label} {day} 检查失败: {e}")
+                n = 0
+            if n:
+                logger.info(f"[归档检查] {label} {day} 补齐 {n} 条")
+            total += n
+            ok += 1
+            # 每完成一项立刻落盘：续跑的最小粒度，代价是可接受的写盘量
+            _verify.mark_done(self._verify_state, it["key"])
+            self._save_verify_state()
+            if idx % 20 == 0 or idx == len(items):
+                logger.info(f"[归档检查] 进度 {idx}/{len(items)}"
+                            f"（{idx * 100 // max(1, len(items))}%），累计补齐 {total} 条")
+            await asyncio.sleep(0.3)
+        # 全部跑完：裁掉窗口外的历史键，写入完成标记与窗口指纹
+        _verify.prune(self._verify_state, targets, self.verify_days, today)
+        self._verify_state["window"] = wk
+        self._verify_state["finished_at"] = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S")
+        self._save_verify_state()
+        logger.info(f"[归档检查] 完成：{ok} 项检查，共补齐 {total} 条，"
                     f"耗时 {time.time() - t0:.0f}s")
         return total
 
@@ -1434,6 +1362,11 @@ class NapcatHistoryExporter(Star):
                     self._last_clean = datetime.now()
                 except Exception as e:
                     logger.error(f"自动清理异常: {e}")
+            # v2.4.0 (P1-1): 每日定时总结/简报（每天各最多一次）
+            try:
+                await self._daily_sched_check()
+            except Exception as e:
+                logger.error(f"[总结] 定时调度异常: {e}")
             await asyncio.sleep(self.interval)
 
     # ---------------------------------------------------------------
@@ -1454,6 +1387,11 @@ class NapcatHistoryExporter(Star):
             self._register_web_apis()
         except Exception as e:
             logger.error(f"[页面] 注册 Web API 失败: {e}")
+        # P2-1: 后台预热行数索引（全新安装时首次打开总览不必等全量统计）
+        try:
+            self._warm_task = asyncio.create_task(self._warm_row_index())
+        except Exception as e:
+            logger.error(f"[页面] 启动索引预热失败: {e}")
         if self.auto_export:
             self._task = asyncio.create_task(self._auto_loop())
             logger.info("NapCat 历史导出器已启动自动归档（每 %ss 增量导出一次，"
@@ -1465,22 +1403,46 @@ class NapcatHistoryExporter(Star):
             # v2.1.0: 自动归档关闭时，启动检查仍按配置执行（独立任务）
             if self.startup_verify:
                 self._verify_task = asyncio.create_task(self._verify_safe())
+            # v2.4.0 (P1-1): 自动归档关闭时，定时总结/简报仍需运行
+            if self.llm_summary_enabled or self.llm_briefing_enabled:
+                self._sched_task = asyncio.create_task(self._sched_loop())
+        if self.llm_summary_enabled or self.llm_briefing_enabled:
+            logger.info("[总结] 定时任务已启用：每日 %s 生成总结%s",
+                        self.llm_summary_time.strftime("%H:%M"),
+                        "（含简报）" if self.llm_briefing_enabled else "")
 
     async def terminate(self) -> None:
-        if self._task:
-            self._task.cancel()
+        # P2-6: 逐一取消全部后台任务（此前只取消 _task/_verify_task，
+        # _names_task / _manual_task / _summary_task 会残留到新实例）。
+        for attr in ("_task", "_verify_task", "_sched_task",
+                     "_names_task", "_manual_task", "_summary_task",
+                     "_warm_task"):
+            task = getattr(self, attr, None)
+            if not task:
+                continue
+            task.cancel()
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._task = None
-        if self._verify_task:
-            self._verify_task.cancel()
-            try:
-                await self._verify_task
-            except asyncio.CancelledError:
-                pass
-            self._verify_task = None
+            except Exception as e:
+                logger.debug(f"[{PLUGIN_NAME}] 取消 {attr} 时异常（可忽略）：{e}")
+            setattr(self, attr, None)
+        # P2-6: 队列里未消费的 job，其 future 若不处理会永久挂起
+        q = getattr(self, "_summary_queue", None)
+        if q is not None:
+            while not q.empty():
+                try:
+                    job = q.get_nowait()
+                except Exception:
+                    break
+                fut = (job or {}).get("future")
+                if fut is not None and not fut.done():
+                    fut.set_exception(_EmptyData("插件正在停止，任务已取消"))
+                try:
+                    q.task_done()
+                except Exception:
+                    pass
 
     # ---------------------------------------------------------------
     # LLM 工具
@@ -1692,7 +1654,7 @@ class NapcatHistoryExporter(Star):
         return files
 
     def _parse_archived_line(self, raw: str) -> dict | None:
-        """解析 JSONL 归档行。"""
+        """解析 JSONL 归档行（单行，保留轻量映射）。"""
         raw = raw.strip()
         if not raw.startswith("{"):
             return None
@@ -1877,6 +1839,137 @@ class NapcatHistoryExporter(Star):
         return (f"✅ 已{verb} → {self._target_label(chat, tid)}\n"
                 f"当前别名：{'、'.join(cur) if cur else '（无）'}")
 
+    @filter.llm_tool("remove_archived_target")
+    async def remove_archived_target(self, event: AstrMessageEvent,
+                                     target: str, chat: str = "",
+                                     dry_run: str = "false"):
+        '''
+        移除一个归档目标（P2-10）：删除其全部归档数据、昵称映射、头像与每日总结，
+        并从 state.json / aliases.json / 配置项 aliases 中移除该目标，此后不再巡检。
+        适合清理错误账号残留、已解散的群等“僵尸目标”（否则每轮都会空调用后端）。
+
+        Args:
+          target(string): 目标：群号 / QQ号 / 已有别名（必填）
+          chat(string): 目标类型：group=群聊 / private=私聊；留空=自动判断
+          dry_run(string): 填 true 时只列出将删除的文件，不真正删除（默认 false）
+
+        Returns: 操作结果摘要
+        '''
+        if not self._is_allowed(event):
+            return "❌ 无权限：仅管理员可以使用此工具。"
+        if not (target or "").strip():
+            return "❌ 请提供目标（群号 / QQ号 / 已有别名）"
+        kind = (chat or "").strip().lower()
+        if kind in ("group", "private"):
+            # 显式指定类型：不再依赖别名/文件推断，避免「移除后别名已清、
+            # 再按纯数字解析会默认落到 group」的错向问题
+            tid = (target or "").strip()
+            if not self._safe_id(tid):
+                return "❌ 指定 chat 时 target 必须是纯数字群号/QQ号"
+            chat_type, real_tid = kind, tid
+        else:
+            r = self._resolve_target(target)
+            if r is None:
+                return (f"❌ 未找到目标「{target.strip()}」：尚未归档或别名不存在")
+            if isinstance(r, tuple) and len(r) == 2 and r[0] == "AMBIGUOUS":
+                return self._alias_hint(target)
+            chat_type, real_tid = r
+        return await self._remove_target(
+            chat_type, real_tid,
+            dry_run=(str(dry_run).lower() in ("1", "true", "yes", "on")))
+
+    def _existing_target_dirs(self, tid: str) -> list:
+        """按磁盘上的实际文件判断该 tid 属于哪种类型（可能两种都有）。"""
+        out = []
+        for c in _aliases.CHATS:
+            if _targets.related_files(self.export_dir, c, tid) \
+                    or self._alias_entry(c, tid) \
+                    or self._state.get(c, {}).get(str(tid)):
+                out.append(c)
+        return out
+
+    async def _remove_target(self, chat: str, tid: str, dry_run: bool = False,
+                             both: bool = True):
+        """P2-10: 移除归档目标的完整实现（工具与控制台 API 共用）。
+
+        both=True 时，若该 tid 在同名另一类型下也有残留文件，一并清理
+        （避免「移除了 private 却留下 group 残骸」）。
+        """
+        targets_to_clean = [chat]
+        if both:
+            extra = [c for c in self._existing_target_dirs(tid) if c != chat]
+            targets_to_clean += extra
+        all_files = []
+        for c in targets_to_clean:
+            all_files += _targets.related_files(self.export_dir, c, tid)
+        files = sorted(set(all_files))
+        label = self._target_label(chat, tid)
+        summary = _targets.describe(chat, tid, files)
+
+        if dry_run:
+            lines = [f"🔍 预览（未删除）：{summary}", f"目标：{label}"]
+            if files:
+                lines.append("将删除的文件：")
+                lines += [f"  - {p.name}" for p in files[:50]]
+                if len(files) > 50:
+                    lines.append(f"  …（共 {len(files)} 个）")
+            else:
+                lines.append("（该目标没有关联文件）")
+            return "\n".join(lines)
+
+        # 1) 删文件
+        removed = 0
+        failed = []
+        for p in files:
+            try:
+                p.unlink(missing_ok=True)
+                removed += 1
+            except Exception as e:
+                failed.append(f"{p.name}: {e}")
+
+        # 2) 清理 state（游标 + protected）—— 覆盖所有待清理类型
+        for c in targets_to_clean:
+            _targets.strip_from_state(self._state, c, tid)
+        self._save_state()
+
+        # 3) 清理 aliases.json
+        for c in targets_to_clean:
+            _targets.strip_from_aliases(self.aliases, c, tid)
+        self._save_aliases()
+
+        # 4) 清理配置项 aliases（否则 _sync_alias_config 会把它复活）
+        try:
+            before_cfg = list(self.config.get("aliases") or [])
+            cfg_lines = _targets.strip_from_config_lines(before_cfg, tid)
+            if cfg_lines != before_cfg:
+                self.config["aliases"] = cfg_lines
+                saver = getattr(self.config, "save_config_async", None)
+                if callable(saver):
+                    await saver()
+                else:
+                    self.config.save_config()
+        except Exception as e:
+            logger.error(f"[页面] 清理配置项 aliases 失败: {e}")
+
+        # 5) 清理内存缓存，避免旧值残留
+        cache = getattr(self, "_nick_cache", None)
+        if isinstance(cache, dict):
+            for c in targets_to_clean:
+                cache.pop(f"{c}:{tid}", None)
+        row_cache = getattr(self, "_row_cache", None)
+        if isinstance(row_cache, dict):
+            for k in [k for k in row_cache if f"_{tid}_" in str(k)]:
+                row_cache.pop(k, None)
+
+        logger.info(f"[归档] 已移除目标 {label}：删除 {removed} 个文件"
+                    + (f"，{len(failed)} 个失败" if failed else ""))
+        out = [f"✅ 已移除目标：{label}", f"删除文件 {removed} 个"
+               + (f"（{len(failed)} 个失败）" if failed else "")]
+        if failed:
+            out += [f"  - {x}" for x in failed[:10]]
+        out.append("已同步清理 state.json / aliases.json / 配置项，此后不再巡检该目标。")
+        return "\n".join(out)
+
     # ---------------- v2.3.0: 插件页面（控制台）API ----------------
 
     _PAGE_CONFIG_FIELDS = [
@@ -1887,6 +1980,7 @@ class NapcatHistoryExporter(Star):
         ("startup_verify", "bool"),
         ("verify_days", "int"),
         ("whitelist", "list"),
+        ("private_whitelist", "list"),
         ("auto_export_friends", "bool"),
         ("archive_bots", "list"),
         ("aliases", "list"),
@@ -1933,6 +2027,9 @@ class NapcatHistoryExporter(Star):
             ("console/summary_config", "POST", self._api_summary_config, "保存总结配置"),
             ("console/config", "GET", self._api_config_get, "读取插件配置"),
             ("console/config", "POST", self._api_config_save, "保存插件配置"),
+            # P2-10: 移除归档目标（清理僵尸目标）
+            ("console/remove_target", "POST", self._api_remove_target,
+             "移除归档目标"),
             # 阶段 1 已实测通过的兼容端点
             ("state", "GET", self._api_state, "总览统计（兼容）"),
             ("targets", "GET", self._api_targets, "归档目标列表（兼容）"),
@@ -1947,32 +2044,23 @@ class NapcatHistoryExporter(Star):
                 logger.error(f"[页面] 注册 API {route} 失败: {e}")
 
     def _target_files(self, chat: str, tid: str) -> list:
-        prefix = "napcat_private_" if chat == "private" else "napcat_"
-        return sorted(self.export_dir.glob(f"{prefix}{tid}_*.jsonl"))
+        return _store.target_files(self.export_dir, chat, tid)
 
     def _count_rows_cached(self, files) -> int:
-        """统计 JSONL 行数（按 mtime/size 缓存，避免每次全量重算）。"""
+        """统计 JSONL 行数（按 mtime/size 缓存，并持久化到 row_index.json）。
+
+        P2-1：内存缓存在重载后失效，57k 行首轮统计约 1.8s；把索引落盘后
+        重载直接复用。文件被改动时 mtime/size 变化会自动重算。
+        """
         cache = getattr(self, "_row_cache", None)
         if cache is None:
             cache = {}
             self._row_cache = cache
-        total = 0
-        for fp in files:
-            try:
-                st = fp.stat()
-                key = str(fp)
-                hit = cache.get(key)
-                if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
-                    total += hit[2]
-                    continue
-                rows = 0
-                with open(fp, encoding="utf-8", errors="replace") as f:
-                    for _line in f:
-                        rows += 1
-                cache[key] = (st.st_mtime_ns, st.st_size, rows)
-                total += rows
-            except Exception:
-                continue
+        before = len(cache)
+        total = _store.count_rows_cached(files, cache)
+        if len(cache) != before:
+            # 有新条目：标记待落盘（不每次都写，避免频繁 I/O）
+            self._row_cache_dirty = True
         return total
 
     def _overview_data(self) -> dict:
@@ -2030,14 +2118,21 @@ class NapcatHistoryExporter(Star):
 
     async def _api_state(self):
         try:
-            return json_response(self._overview_data())
+            # P2-1: 总览要扫全部目标 + 统计所有文件行数，是最重的一个
+            data = await asyncio.to_thread(self._overview_data)
+            # 行数索引有更新时落盘，供下次重载后直接复用
+            if getattr(self, "_row_cache_dirty", False):
+                await asyncio.to_thread(self._save_row_cache)
+                self._row_cache_dirty = False
+            return json_response(data)
         except Exception as e:
             logger.error(f"[页面] 总览数据失败: {e}")
             return error_response(f"总览数据失败: {e}", status_code=500)
 
     async def _api_targets(self):
         try:
-            return json_response({"targets": self._overview_data()["targets"]})
+            data = await asyncio.to_thread(self._overview_data)
+            return json_response({"targets": data["targets"]})
         except Exception as e:
             return error_response(f"目标列表失败: {e}", status_code=500)
 
@@ -2046,6 +2141,14 @@ class NapcatHistoryExporter(Star):
         date = (q.get("date") or "").strip()
         if date and not self._safe_date(date):
             return error_response("date 非法（应为 YYYY-MM-DD）", status_code=400)
+        # P3-4: start/end 的校验必须在「无归档文件」早退之前完成，
+        # 否则不存在的目标 + 非法日期会静默返回空结果而不是报错。
+        rng_start = (q.get("start") or "").strip()
+        rng_end = (q.get("end") or "").strip()
+        if rng_start and not self._safe_date(rng_start):
+            return error_response("start 非法（应为 YYYY-MM-DD）", status_code=400)
+        if rng_end and not self._safe_date(rng_end):
+            return error_response("end 非法（应为 YYYY-MM-DD）", status_code=400)
         try:
             limit = int(q.get("limit") or 200)
         except Exception:
@@ -2063,14 +2166,10 @@ class NapcatHistoryExporter(Star):
         dates = [fp.name.split("_")[-1][:-6] for fp in files]
         info = {"chat": chat, "target": tid, "label": self._target_label(chat, tid)}
         if not files:
-            return json_response({"target": info, "dates": [], "messages": [], "total": 0})
+            # P0-2：与正常分支保持同一契约（统一用 items，不再返回 messages）
+            return json_response({"target": info, "dates": [], "items": [],
+                                  "total": 0, "offset": 0, "has_more": False})
         # v2.3.2：支持日期区间（start/end），无区间时沿用单个 date
-        rng_start = (q.get("start") or "").strip()
-        rng_end = (q.get("end") or "").strip()
-        if rng_start and not self._safe_date(rng_start):
-            return error_response("start 非法（应为 YYYY-MM-DD）", status_code=400)
-        if rng_end and not self._safe_date(rng_end):
-            return error_response("end 非法（应为 YYYY-MM-DD）", status_code=400)
         if not (rng_start or rng_end):
             rng_start = rng_end = date or dates[-1]
         elif rng_start and rng_end and rng_start > rng_end:
@@ -2080,29 +2179,18 @@ class NapcatHistoryExporter(Star):
             d = fp.name.split("_")[-1][:-6]
             if (not rng_start or d >= rng_start) and (not rng_end or d <= rng_end):
                 sel_files.append(fp)
-        records = []
-        for fp in sel_files:
-            d = fp.name.split("_")[-1][:-6]
-            try:
-                with open(fp, encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            rec = json.loads(line)
-                        except Exception:
-                            continue
-                        rec["_date"] = d
-                        records.append(rec)
-            except Exception as e:
-                return error_response(f"读取失败: {e}", status_code=500)
+        # P2-1: 整日文件读取是重活（现网单文件可达上千行），
+        # 放进线程池，避免阻塞 AstrBot 事件循环（机器人回复延迟/心跳抖动）
+        try:
+            records = await asyncio.to_thread(_aggregate.read_messages, sel_files)
+        except Exception as e:
+            return error_response(f"读取失败: {e}", status_code=500)
         total = len(records)
         end_i = max(0, total - offset)
         start_i = max(0, end_i - limit)
         page = records[start_i:end_i]
         items = []
-        for rec in page:
+        for i, rec in enumerate(page):
             items.append({
                 "seq": rec.get("seq"),
                 "date": rec.get("_date") or "",
@@ -2111,6 +2199,13 @@ class NapcatHistoryExporter(Star):
                 "sender_name": rec.get("nickname") or "",
                 "text": rec.get("content") or "",
                 "type": rec.get("chat") or chat,
+                # P0-2: v2.3.0 宣称「引用条可点击跳转」，但此前 items 没带 reply，
+                # 前端 bubble() 依赖 m.reply 的整条链路是死的（归档文件里有该字段）。
+                "reply": rec.get("reply"),
+                # P0-4: 该条在「当次选中范围」内距末尾的偏移（0 = 最后一条）。
+                # 前端据此判断要 loadOlder 多少次才能让目标进入已加载窗口，
+                # 避免旧实现用 nodes[total-1-index] 在分页场景下必然错位。
+                "offset_from_end": len(records) - (start_i + i) - 1,
             })
         return json_response({
             "target": info,
@@ -2122,7 +2217,7 @@ class NapcatHistoryExporter(Star):
             "total": total,
             "offset": offset,
             "has_more": start_i > 0,
-            "messages": page,
+            # P0-2: 不再回传原始 page（前端从未使用，响应体白白翻倍）
             "items": items,
         })
 
@@ -2188,21 +2283,42 @@ class NapcatHistoryExporter(Star):
             self._sync_alias_config()
         except Exception as e:
             logger.error(f"[页面] 同步别名配置失败: {e}")
-        return json_response({"ok": True, "saved": sorted(cleaned.keys())})
+        # P1-2: 把可热更新项立刻回写到运行态，无需重载插件。
+        # 现场曾出现「配置文件改成 60 天，运行态仍是 14 天」——正是缺了这一步。
+        try:
+            changed = self._apply_runtime_config()
+        except Exception as e:
+            logger.error(f"[页面] 应用配置到运行态失败: {e}")
+            changed = {}
+        if changed:
+            detail = "，".join(f"{k}: {old!r}→{new!r}"
+                              for k, (old, new) in changed.items())
+            logger.info(f"[页面] 配置已热生效：{detail}")
+        # 开关类改动需要真的启停后台任务（否则只改了属性、行为不变）
+        try:
+            await self._sync_background_tasks()
+        except Exception as e:
+            logger.error(f"[页面] 同步后台任务失败: {e}")
+        # 导出目录变更需要重载（涉及数据迁移与路径绑定）
+        needs_reload = "export_dir" in cleaned and \
+            cleaned.get("export_dir") != str(self.export_dir)
+        resp = {"ok": True, "saved": sorted(cleaned.keys()),
+                "applied": sorted(changed.keys())}
+        if needs_reload:
+            resp["needs_reload"] = ["export_dir"]
+            resp["message"] = ("导出目录的改动需要重载插件后才会生效"
+                               "（将触发旧目录自动迁移）")
+        return json_response(resp)
 
     # ---------------- 阶段 2：日期 / 统计 / 头像 ----------------
 
     @staticmethod
     def _safe_id(v) -> bool:
-        v = (v or "").strip()
-        return bool(v) and v.isdigit() and len(v) <= 20
+        return _backend_mod.safe_id(v)
 
     @staticmethod
     def _safe_date(v) -> bool:
-        v = (v or "").strip()
-        if len(v) != 10 or v[4] != "-" or v[7] != "-":
-            return False
-        return all(c.isdigit() or c == "-" for c in v)
+        return _backend_mod.safe_date(v)
 
     def _resolve_chat_target(self, q):
         """从 query 解析 (chat, tid)：支持 chat+target_id，或 target(群号/QQ/别名)。
@@ -2229,18 +2345,27 @@ class NapcatHistoryExporter(Star):
         if err:
             return error_response(err, status_code=400)
         chat, tid = r
+        files = self._target_files(chat, tid)
+        # P2-1: 需要逐文件统计行数（缓存未命中时会读全文件），放线程池
+        out = await asyncio.to_thread(self._dates_sync, files)
+        return json_response({
+            "target": {"chat": chat, "target": tid, "label": self._target_label(chat, tid)},
+            "dates": out,
+        })
+
+    def _dates_sync(self, files) -> list:
+        """日期列表的同步实现（供 to_thread 调用）。"""
         out = []
-        for fp in self._target_files(chat, tid):
+        for fp in files:
             date = fp.name.split("_")[-1][:-6]
             try:
                 size = fp.stat().st_size
             except Exception:
                 size = 0
-            out.append({"date": date, "count": self._count_rows_cached([fp]), "size": size})
-        return json_response({
-            "target": {"chat": chat, "target": tid, "label": self._target_label(chat, tid)},
-            "dates": out,
-        })
+            out.append({"date": date,
+                        "count": self._count_rows_cached([fp]),
+                        "size": size})
+        return out
 
     async def _api_stats(self):
         q = request.query
@@ -2250,71 +2375,27 @@ class NapcatHistoryExporter(Star):
         chat, tid = r
         start = (q.get("start") or "").strip()
         end = (q.get("end") or "").strip()
-        files = self._target_files(chat, tid)
-        if start or end:
-            if start and not self._safe_date(start):
-                return error_response("start 非法（应为 YYYY-MM-DD）", status_code=400)
-            if end and not self._safe_date(end):
-                return error_response("end 非法（应为 YYYY-MM-DD）", status_code=400)
-            if start and end and start > end:
-                start, end = end, start
-            recent = [fp for fp in files
-                      if (not start or fp.name.split("_")[-1][:-6] >= start)
-                      and (not end or fp.name.split("_")[-1][:-6] <= end)]
-        else:
-            try:
-                days = int(q.get("days") or 30)
-            except Exception:
-                days = 30
-            days = max(1, min(days, 365))
-            recent = files[-days:] if len(files) > days else files
-        daily = []
-        by_sender = {}
-        hourly = [0] * 24
-        total = 0
-        for fp in recent:
-            date = fp.name.split("_")[-1][:-6]
-            n = 0
-            try:
-                with open(fp, encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        n += 1
-                        try:
-                            rec = json.loads(line)
-                        except Exception:
-                            continue
-                        uid = str(rec.get("user_id") or "")
-                        if uid:
-                            item = by_sender.setdefault(
-                                uid, {"user_id": uid, "sender_name": "", "count": 0})
-                            item["count"] += 1
-                            if not item["sender_name"]:
-                                item["sender_name"] = str(rec.get("nickname") or "")
-                        t = str(rec.get("t") or "")
-                        if len(t) >= 13:
-                            try:
-                                hh = int(t[11:13])
-                                if 0 <= hh < 24:
-                                    hourly[hh] += 1
-                            except Exception:
-                                pass
-            except Exception:
-                continue
-            daily.append({"date": date, "count": n})
-            total += n
-        top = sorted(by_sender.values(), key=lambda x: -x["count"])[:10]
+        if start and not self._safe_date(start):
+            return error_response("start 非法（应为 YYYY-MM-DD）", status_code=400)
+        if end and not self._safe_date(end):
+            return error_response("end 非法（应为 YYYY-MM-DD）", status_code=400)
+        try:
+            days = int(q.get("days") or 30)
+        except Exception:
+            days = 30
+        recent = _aggregate.pick_recent_files(
+            self._target_files(chat, tid), start, end, days)
+        # P2-1: 统计需要解析每个文件的每一行，是 O(总行数) 的重活
+        agg = await asyncio.to_thread(_aggregate.stats, recent)
         return json_response({
             "target": {"chat": chat, "target": tid, "label": self._target_label(chat, tid)},
             "days": len(recent),
-            "start": (recent[0].name.split("_")[-1][:-6] if recent else start),
-            "end": (recent[-1].name.split("_")[-1][:-6] if recent else end),
-            "total": total,
-            "daily": daily,
-            "top_senders": top,
-            "hourly": hourly,
+            "start": (_aggregate.file_date(recent[0]) if recent else start),
+            "end": (_aggregate.file_date(recent[-1]) if recent else end),
+            "total": agg["total"],
+            "daily": agg["daily"],
+            "top_senders": agg["top_senders"],
+            "hourly": agg["hourly"],
         })
 
     @staticmethod
@@ -2487,47 +2568,11 @@ class NapcatHistoryExporter(Star):
         if err:
             return error_response(err, status_code=400)
         chat, tid = r
-        hits = []
-        cap = limit * 5
-        for fp in self._target_files(chat, tid):
-            date = fp.name.split("_")[-1][:-6]
-            if start and date < start:
-                continue
-            if end and date > end:
-                continue
-            try:
-                with open(fp, encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            rec = json.loads(line)
-                        except Exception:
-                            continue
-                        text = str(rec.get("content") or "")
-                        if kw and kw.lower() not in text.lower():
-                            continue
-                        uid = str(rec.get("user_id") or "")
-                        nick = str(rec.get("nickname") or "")
-                        if user and user not in uid and user.lower() not in nick.lower():
-                            continue
-                        hits.append({
-                            "date": date,
-                            "seq": rec.get("seq"),
-                            "time": rec.get("t", ""),
-                            "sender_id": uid,
-                            "sender_name": nick,
-                            "text": text,
-                        })
-                        if len(hits) >= cap:
-                            break
-            except Exception:
-                continue
-            if len(hits) >= cap:
-                break
-        hits.sort(key=lambda x: x["time"])
-        return json_response({"total": len(hits), "items": hits[-limit:]})
+        # P2-1: 搜索会扫最多 limit*5 条消息，放线程池
+        result = await asyncio.to_thread(
+            _aggregate.search, self._target_files(chat, tid), kw, user,
+            limit, start, end)
+        return json_response(result)
 
     async def _api_members(self):
         q = request.query
@@ -2558,42 +2603,53 @@ class NapcatHistoryExporter(Star):
         want = str(q.get("seq") or q.get("id") or "").strip()
         if not want:
             return error_response("缺少 seq/id 参数", status_code=400)
-        for fp in reversed(self._target_files(chat, tid)):
-            date = fp.name.split("_")[-1][:-6]
-            idx = 0
-            try:
-                with open(fp, encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            rec = json.loads(line)
-                        except Exception:
-                            idx += 1
-                            continue
-                        cands = [str(rec.get("seq") or "")]
-                        rep = rec.get("reply") or {}
-                        if isinstance(rep, dict):
-                            cands.append(str(rep.get("id") or ""))
-                            cands.append(str(rep.get("message_id") or ""))
-                            cands.append(str(rep.get("seq") or ""))
-                        if want in cands:
-                            return json_response({"date": date, "index": idx})
-                        idx += 1
-            except Exception:
-                continue
-        return error_response("未找到该消息", status_code=404)
+        # P0-3/P0-4: 定位必须返回「文件内 0 基行号」与「距末尾偏移」。
+        # 前端不能用 seq 当行索引（seq 是 message_seq，与行号无关）。
+        files = self._target_files(chat, tid)
+        # P2-1: 定位要从最新文件往回逐个扫，放线程池
+        hit = await asyncio.to_thread(_aggregate.locate, files, want)
+        if not hit:
+            return error_response("未找到该消息", status_code=404)
+        target_date, index = hit
+        # 计算该消息在其所属文件里距末尾的偏移
+        fp = next((f for f in files
+                   if _aggregate.file_date(f) == target_date), None)
+        row_count = 0
+        if fp is not None:
+            row_count = await asyncio.to_thread(_count_lines, fp)
+        offset_from_end = max(0, row_count - index - 1)
+        return json_response({
+            "date": target_date,
+            "index": index,
+            "total": row_count,
+            "offset_from_end": offset_from_end,
+        })
 
     async def _api_archive(self):
-        """手动触发一次增量归档（后台执行，不阻塞页面）。"""
+        """手动触发一次增量归档（后台执行，不阻塞页面）。
+
+        P1-3：按钮语义应与字面「立即归档」一致——
+        - 不受 `whitelist` 限制（白名单只管定时循环，与 LLM 工具口径一致）
+        - `apply_rules=False`：不限于当天，可补齐历史
+        - 归档成功后把目标登记进 `protected`，避免被自动清理删掉
+        """
         if getattr(self, "_manual_archiving", False):
             return json_response({"ok": True, "busy": True})
         self._manual_archiving = True
 
         async def run():
             try:
-                n = await self._auto_export_once()
+                n = await self._auto_export_once(apply_rules=False)
+                # 按钮归档 = 用户主动行为，登记保护名单（与 LLM 工具一致）
+                if n:
+                    prot = self._state.setdefault("protected", {})
+                    gt = prot.setdefault("group", [])
+                    for chat, tid in self._scan_archived_targets():
+                        bucket = gt if chat == "group" else \
+                            prot.setdefault("private", [])
+                        if tid not in bucket:
+                            bucket.append(tid)
+                    self._save_state()
                 logger.info(f"[页面] 手动触发归档完成，新增 {n} 条")
             except Exception as e:
                 logger.error(f"[页面] 手动触发归档失败: {e}")
@@ -2622,6 +2678,11 @@ class NapcatHistoryExporter(Star):
                     await self._do_briefing(job)
                 else:
                     await self._do_summary(job)
+            except _EmptyData as e:
+                # P2-11：空数据是正常状态，不算故障
+                logger.info(f"[总结] 无数据可处理: {e}")
+                if fut is not None and not fut.done():
+                    fut.set_exception(e)
             except Exception as e:
                 logger.error(f"[总结] 任务失败: {e}")
                 if fut is not None and not fut.done():
@@ -2689,7 +2750,7 @@ class NapcatHistoryExporter(Star):
         chat, tid, date = job["chat"], job["tid"], job["date"]
         records = self._day_records(chat, tid, date)
         if not records:
-            raise RuntimeError("该日期没有归档消息")
+            raise _EmptyData("该日期没有归档消息")
         label = self._target_label(chat, tid)
         try:
             trend_days = int(self.config.get("llm_summary_trend_days", 3) or 3)
@@ -2757,7 +2818,7 @@ class NapcatHistoryExporter(Star):
                 except Exception as e:
                     logger.warning(f"[{PLUGIN_NAME}] 读取每日总结失败：{p}：{e}")
         if not parts:
-            raise RuntimeError("还没有每日总结可汇总（请先在「统计」里生成某天总结）")
+            raise _EmptyData("还没有每日总结可汇总（请先在「统计」里生成某天总结）")
         try:
             max_chars = int(self.config.get("llm_briefing_max_chars", 2000) or 2000)
         except Exception:
@@ -2798,7 +2859,9 @@ class NapcatHistoryExporter(Star):
         cached = self._summary_path(chat, tid, date)
         if cached.exists() and not body.get("force"):
             try:
-                return json_response({"summary": cached.read_text(encoding="utf-8"),
+                # P2-1: 总结文件可能上万字符，读盘放线程池
+                text = await asyncio.to_thread(_read_text_file, cached)
+                return json_response({"summary": text,
                                       "date": date, "cached": True})
             except Exception:
                 pass
@@ -2808,6 +2871,11 @@ class NapcatHistoryExporter(Star):
         await self._summary_queue.put(job)
         try:
             await asyncio.wait_for(fut, timeout=300)
+        except _EmptyData as e:
+            # P2-11：空数据是正常状态，返回 200 + 友好文案，日志用 INFO
+            logger.info(f"[总结] 无数据可总结：{e}")
+            return json_response({"summary": "", "date": date,
+                                  "empty": True, "message": str(e)})
         except Exception as e:
             return error_response(f"总结失败或超时: {e}", status_code=500)
         res = job.get("result") or {}
@@ -2823,15 +2891,23 @@ class NapcatHistoryExporter(Star):
             return error_response(err, status_code=400)
         chat, tid = r
         items = []
+        # P2-1: 可能有几十个总结文件，整体放线程池
+        items = await asyncio.to_thread(self._summary_items_sync, chat, tid)
+        return json_response({"items": items})
+
+    def _summary_items_sync(self, chat: str, tid: str) -> list:
+        """读取某目标全部已有总结（供 to_thread 调用）。"""
+        items = []
         for fp in self._target_files(chat, tid):
             d = fp.name.split("_")[-1][:-6]
             p = self._summary_path(chat, tid, d)
             if p.exists():
                 try:
-                    items.append({"date": d, "summary": p.read_text(encoding="utf-8")})
+                    items.append({"date": d,
+                                  "summary": p.read_text(encoding="utf-8")})
                 except Exception:
                     pass
-        return json_response({"items": items})
+        return items
 
     async def _api_briefing(self):
         q = request.query
@@ -2845,8 +2921,11 @@ class NapcatHistoryExporter(Star):
             files = sorted(root.glob("*/brief.md"))
             if files:
                 try:
-                    return json_response({"brief": files[-1].read_text(encoding="utf-8"),
-                                          "date": files[-1].parent.name, "cached": True})
+                    # P2-1: 简报文本通常较长，读盘放线程池
+                    text = await asyncio.to_thread(_read_text_file, files[-1])
+                    return json_response({"brief": text,
+                                          "date": files[-1].parent.name,
+                                          "cached": True})
                 except Exception:
                     pass
         self._ensure_summary_worker()
@@ -2855,6 +2934,10 @@ class NapcatHistoryExporter(Star):
         await self._summary_queue.put(job)
         try:
             await asyncio.wait_for(fut, timeout=360)
+        except _EmptyData as e:
+            # P2-11：空数据是正常状态，返回 200 + 友好文案，日志用 INFO
+            logger.info(f"[简报] 无数据可汇总：{e}")
+            return json_response({"brief": "", "empty": True, "message": str(e)})
         except Exception as e:
             return error_response(f"简报生成失败或超时: {e}", status_code=500)
         res = job.get("result") or {}
@@ -2865,3 +2948,34 @@ class NapcatHistoryExporter(Star):
 
     async def _api_summary_config(self):
         return await self._api_config_save()
+
+    async def _api_remove_target(self):
+        """P2-10: 移除归档目标（控制台入口）。
+
+        body = {chat, target_id, dry_run}；dry_run 为真时只预览不删除。
+        """
+        payload = await request.json(default={})
+        body = payload if isinstance(payload, dict) else {}
+        q = request.query
+        # 兼容 query 参数（GET 预览场景）
+        if not body:
+            body = {k: q.get(k) for k in ("chat", "target_id", "dry_run")
+                    if q.get(k)}
+        chat = str(body.get("chat") or "").strip().lower()
+        tid = str(body.get("target_id") or "").strip()
+        dry = str(body.get("dry_run") or "").lower() in ("1", "true", "yes", "on")
+        if chat not in ("group", "private") or not self._safe_id(tid):
+            return error_response("需要 chat(group/private) 与合法的 target_id",
+                                  status_code=400)
+        try:
+            msg = await self._remove_target(chat, tid, dry_run=dry)
+        except Exception as e:
+            logger.error(f"[页面] 移除目标失败: {e}")
+            return error_response(f"移除失败: {e}", status_code=500)
+        return json_response({"ok": True, "dry_run": dry, "message": msg})
+# ===== P3-1（v2.4.0）：类名现代化，保留旧名别名 =====
+# 旧名 NapcatHistoryExporter 在 v2.0.0 改名后一直沿用，与项目「chat_history_archiver」
+# 已不符。这里保留同名引用，避免仍在引用旧名的第三方代码/旧文档失效；
+# 注意：别名不再触发 Star.__init_subclass__（同一个类对象），因此不会产生
+# 额外的 star_map 条目，不影响插件加载。
+NapcatHistoryExporter = ChatHistoryArchiver

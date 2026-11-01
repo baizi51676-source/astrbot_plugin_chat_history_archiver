@@ -27,14 +27,16 @@ const FIELDS = [
   { key: 'backend', label: '后端协议', type: 'select',
     options: [['auto', '自动探测'], ['napcat', 'NapCat'], ['snowluma', 'SnowLuma']] },
   { key: 'export_dir', label: '导出目录', type: 'text',
-    hint: '相对 AstrBot 工作目录，如 data/workspaces/napcat_exports' },
+    hint: '留空 = data/plugin_data/astrbot_plugin_chat_history_archiver；相对路径会被约束到插件数据目录下，绝对路径在 plugin_data 之外会告警。改动需重载插件' },
   { key: 'auto_export', label: '自动归档', type: 'bool', hint: '开启后按间隔定时增量归档' },
   { key: 'interval_seconds', label: '循环间隔（秒）', type: 'int', hint: '最小 30 秒' },
   { key: 'startup_verify', label: '启动检查补全', type: 'bool', hint: '启动时自动补齐缺失或不全的归档记录' },
-  { key: 'verify_days', label: '启动检查天数', type: 'int', hint: '1-30 天' },
+  { key: 'verify_days', label: '启动检查天数', type: 'int', hint: '1-180 天（超范围会告警并按上限生效）' },
   { key: 'whitelist', label: '自动归档群白名单', type: 'list', wide: true,
     hint: '每行一个群号；留空 = 全部群（手动归档不受限）' },
   { key: 'auto_export_friends', label: '定时同时导出私聊', type: 'bool' },
+  { key: 'private_whitelist', label: '私聊归档白名单', type: 'list', wide: true,
+    hint: '每行一个 QQ 号；留空 = 只归档「已登记」的私聊（有文件/游标/别名），这样已清理的僵尸账号不会被反复巡检。填写则严格只归档名单内' },
   { key: 'archive_bots', label: '多 bot 归档白名单', type: 'list', wide: true,
     hint: '每行一个登录 QQ 号或平台实例 id；留空 = 全部 aiocqhttp 实例' },
   { key: 'aliases', label: '对话别名', type: 'list', wide: true,
@@ -46,11 +48,11 @@ const FIELDS = [
   { key: 'ui_default_tab', label: '默认打开页面', type: 'text', hint: 'overview / messages / stats / config' },
   { key: 'ui_messages_page_size', label: '消息分页大小', type: 'int', hint: '10-500' },
   { key: 'ui_avatar_cache', label: '缓存发言人头像', type: 'bool', hint: '缓存到导出目录 avatars/（7 天更新）' },
-  { key: 'llm_summary_enabled', label: 'LLM 每日总结', type: 'bool', hint: '默认关闭；开启后按时间自动总结（产生费用）' },
+  { key: 'llm_summary_enabled', label: 'LLM 每日总结', type: 'bool', hint: '默认关闭；开启后每天在指定时间自动总结各目标（产生费用）' },
   { key: 'llm_summary_provider', label: '总结用模型', type: 'text', hint: '留空 = 聊天主模型' },
-  { key: 'llm_summary_time', label: '自动总结时间', type: 'text', hint: 'HH:MM' },
+  { key: 'llm_summary_time', label: '自动总结时间', type: 'text', hint: 'HH:MM；每天只跑一次，错过不补跑中间日' },
   { key: 'llm_summary_trend_days', label: '趋势合并天数', type: 'int', hint: '1-30' },
-  { key: 'llm_briefing_enabled', label: '总览简报', type: 'bool', hint: '默认关闭' },
+  { key: 'llm_briefing_enabled', label: '总览简报', type: 'bool', hint: '默认关闭；在总结之后生成一次' },
   { key: 'llm_summary_max_chars', label: '单群总结字数', type: 'int', hint: '默认 1000（100-5000）' },
   { key: 'llm_briefing_max_chars', label: '简报字数', type: 'int', hint: '默认 2000（200-8000）' },
 ];
@@ -87,6 +89,34 @@ function toast(msg, isErr) {
   el.className = 'toast' + (isErr ? ' err' : '');
   clearTimeout(el._t);
   el._t = setTimeout(() => { el.className = 'toast hidden'; }, 3500);
+}
+
+/* P2-10: 移除归档目标。
+   受限 iframe 里 window.confirm 不一定可用，因此用「两步点击」确认：
+   第一次点按钮变红提示再点一次，3 秒内不点则自动复位。 */
+let _pendingRemove = '';
+async function removeTarget(chat, tid, label) {
+  const key = chat + ':' + tid;
+  if (_pendingRemove !== key) {
+    _pendingRemove = key;
+    toast('再点一次「移除」将删除 ' + (label || tid) + ' 的全部归档数据', true);
+    setTimeout(() => {
+      if (_pendingRemove === key) _pendingRemove = '';
+    }, 3000);
+    return;
+  }
+  _pendingRemove = '';
+  try {
+    const res = await apiPost('remove_target', {
+      chat: chat, target_id: tid, dry_run: false,
+    });
+    const msg = (res && res.message) || '已移除';
+    toast(msg.split('\n')[0]);
+    await ensureTargets(true);
+    await loadOverview();
+  } catch (e) {
+    toast('移除失败：' + errText(e), true);
+  }
 }
 
 function esc(s) {
@@ -212,8 +242,12 @@ function renderOverview(d) {
     + '<td>' + t.days + '</td>'
     + '<td>' + (t.rows || 0).toLocaleString() + '</td>'
     + '<td>' + fmtSize(t.size) + '</td>'
-    + '<td>' + esc(t.last_date || '—') + '</td></tr>').join('')
-    : '<tr><td colspan="8" class="muted">暂无归档目标</td></tr>';
+    + '<td>' + esc(t.last_date || '—') + '</td>'
+    /* P2-10: 移除归档目标（清理僵尸目标，避免每轮空调用后端） */
+    + '<td><button class="ghost mini" data-rm-chat="' + esc(t.chat)
+    + '" data-rm-tid="' + esc(t.target) + '" data-rm-label="'
+    + esc(t.name || t.label || t.target) + '">移除</button></td></tr>').join('')
+    : '<tr><td colspan="9" class="muted">暂无归档目标</td></tr>';
 
   $('export-dir').textContent = '导出目录：' + (d.export_dir || '—')
     + '（后端：' + (d.backend || 'auto') + '）';
@@ -710,6 +744,11 @@ async function boot() {
   document.addEventListener('click', (e) => {
     const chip = e.target.closest && e.target.closest('.reply-chip');
     if (chip) { onReplyClick(chip.dataset.reply); return; }
+    const rm = e.target.closest && e.target.closest('[data-rm-chat]');
+    if (rm) {
+      removeTarget(rm.dataset.rmChat, rm.dataset.rmTid, rm.dataset.rmLabel);
+      return;
+    }
     const go = e.target.closest && e.target.closest('[data-goto-date]');
     if (go) { gotoHit(go.dataset.gotoDate, go.dataset.gotoSeq); }
     const hist = e.target.closest && e.target.closest('[data-hit-date]');
@@ -797,41 +836,95 @@ async function ensureNames(refresh) {
   }
 }
 
+/* P0-3/P0-4：统一定位入口。
+   后端 locate 返回 {date, index, total, offset_from_end}：
+   - index          文件内 0 基行号（不能直接当 DOM 索引）
+   - offset_from_end 目标距末尾的条数（0 = 最后一条）
+   state.chat 是「从末尾向前」的窗口，state.offset 是已向前加载的条数，
+   因此需要的 offset = offset_from_end，加载到该深度后
+   DOM 下标 = (state.chat.length - 1) - offset_from_end。 */
+async function gotoLocated(loc) {
+  if (!loc || !loc.date) {
+    toast('该消息不在归档中', true);
+    return false;
+  }
+  const wantOffset = Number(loc.offset_from_end || 0);
+  /* 切换到目标日期（若当前范围不包含） */
+  const sameDay = state.range.start === loc.date && state.range.end === loc.date;
+  if (!sameDay) {
+    applyRange(loc.date, loc.date, loc.date, true);
+    state.offset = 0;
+    state.chat = [];
+    await loadMessages(true);
+  } else if (state.offset > wantOffset || !state.chat.length) {
+    /* 同一天但窗口不够深：重置窗口，按所需深度一次加载 */
+    state.offset = 0;
+    state.chat = [];
+    await loadMessages(true);
+  }
+  /* 逐页向前加载，直到目标进入窗口（或没有更多）。
+     关键：窗口已覆盖 wantOffset 时（state.offset 索引覆盖 0..offset-1 的
+     末尾片段，长度足够即已包含目标），不应再加载。
+     判据用「已加载条数 > wantOffset」而不是「offset <= wantOffset」，
+     否则 wantOffset=0 且 offset=0 时会白白多加载一页。 */
+  let guard = 0;
+  while (state.hasMore && state.chat.length <= wantOffset && guard < 50) {
+    guard += 1;
+    const before = state.offset;
+    await loadOlder();
+    if (state.offset === before) break; /* 加载不到更多，避免死循环 */
+  }
+  switchView('messages');
+  highlightAt(wantOffset);
+  return true;
+}
+
+async function locateByKey(key, dateHint) {
+  if (!key) return null;
+  if (dateHint) {
+    /* 已知日期时先限定范围，减少全量扫描 */
+    applyRange(dateHint, dateHint, dateHint, true);
+  }
+  try {
+    return await apiGet('locate', {
+      chat: state.target.chat,
+      target_id: state.target.target,
+      id: key,
+    });
+  } catch (e) {
+    return null;
+  }
+}
+
 async function onReplyClick(key) {
   if (!key) return;
   syncTargetFromSelect();
   if (!state.target) return;
   toast('正在定位引用消息…');
   try {
-    const loc = await apiGet('locate', {
-      chat: state.target.chat,
-      target_id: state.target.target,
-      id: key,
-    });
-    if (loc && loc.date) {
-      if (loc.date !== state.range.start || loc.date !== state.range.end) {
-        applyRange(loc.date, loc.date, loc.date, true);
-        state.offset = 0;
-        await loadMessages(true);
-      }
-      highlightAt(loc.index);
-    } else {
-      toast('该引用消息不在归档中', true);
+    const loc = await locateByKey(key);
+    if (await gotoLocated(loc)) {
+      toast('已定位到引用消息');
     }
   } catch (e) {
     toast('定位失败：' + errText(e), true);
   }
 }
 
-function highlightAt(index) {
+/* P0-4：按「距末尾偏移」高亮，而不是用文件行号硬套 DOM 下标。
+   offsetFromEnd=0 表示最后一条。DOM 中 bubble 与 state.chat 一一对应。 */
+function highlightAt(offsetFromEnd) {
   const box = $('chat');
   if (!box) return;
   const nodes = box.querySelectorAll('.bubble');
   if (!nodes.length) return;
-  const total = state.chat.length;
-  let node = null;
-  if (index >= 0 && index < total) node = nodes[Math.max(0, total - 1 - index)] || null;
-  if (!node) return;
+  const n = state.chat.length;
+  const idx = Math.max(0, n - 1 - Number(offsetFromEnd || 0));
+  const node = nodes[idx] || null;
+  if (!node) {
+    toast('消息不在当前已加载范围内，可继续向上加载', true);
+    return;
+  }
   node.classList.add('hl');
   node.scrollIntoView({ block: 'center' });
   setTimeout(() => node.classList.remove('hl'), 2000);
@@ -873,11 +966,27 @@ async function runSearch() {
 }
 
 async function gotoHit(date, seq) {
-  if (date) applyRange(date, date, date, true);
-  state.offset = 0;
-  await loadMessages(true);
-  switchView('messages');
-  if (seq) setTimeout(() => highlightAt(parseInt(seq, 10)), 300);
+  syncTargetFromSelect();
+  if (!state.target) return;
+  /* P0-3：seq 是 message_seq，与文件行号无关，不能直接当索引。
+     统一走后端 locate 拿 offset_from_end，再交给 gotoLocated。 */
+  try {
+    const loc = await locateByKey(seq, date);
+    if (loc) {
+      await gotoLocated(loc);
+    } else {
+      /* 定位失败时至少切到该日期，保证用户能看到当天消息 */
+      if (date) {
+        applyRange(date, date, date, true);
+        state.offset = 0;
+        await loadMessages(true);
+      }
+      switchView('messages');
+      toast('未能定位到该消息', true);
+    }
+  } catch (e) {
+    toast('定位失败：' + errText(e), true);
+  }
 }
 
 async function genSummary(force) {
